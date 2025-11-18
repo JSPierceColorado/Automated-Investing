@@ -11,7 +11,7 @@ from google.oauth2.service_account import Credentials
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed  # use IEX instead of SIP
+from alpaca.data.enums import DataFeed, Adjustment  # use IEX instead of SIP; Adjustment for split-adjusted bars
 
 
 # -----------------------------
@@ -314,13 +314,16 @@ def fetch_alpaca_bars(symbol: str, is_crypto: bool, stock_client, crypto_client,
         # alpaca-py: bars.data[symbol] is list[Bar]
         series = bars.data[symbol] if hasattr(bars, "data") else bars[symbol]
     else:
+        # For stocks, use split-adjusted data so long MAs & indicators
+        # match charting platforms like TradingView.
         req = StockBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=TimeFrame.Day,
             start=start,
             end=now,
             limit=max_days,
-            feed=DataFeed.IEX,  # force IEX, avoid SIP error
+            feed=DataFeed.IEX,          # force IEX, avoid SIP error
+            adjustment=Adjustment.SPLIT # <-- key change: use split-adjusted prices
         )
         bars = stock_client.get_stock_bars(req)
         series = bars.data[symbol] if hasattr(bars, "data") else bars[symbol]
@@ -477,7 +480,7 @@ def write_rows_to_sheet(ws, rows):
 
     data = [header] + rows
 
-    # 🔧 IMPORTANT CHANGE:
+    # 🔧 IMPORTANT:
     # Clear ONLY columns A:V so that W onward (external functions / formulas)
     # remain untouched.
     ws.batch_clear(['A:V'])
