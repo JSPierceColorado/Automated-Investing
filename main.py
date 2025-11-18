@@ -103,7 +103,7 @@ def compute_atr_rma(highs, lows, closes, length=10):
 
 def compute_supertrend_like_trailing_stop(closes, atr, atr_mult=1.2):
     """
-    Matches the SuperTrend-style trailing stop logic:
+    SuperTrend-style trailing stop:
 
     entryLoss = atr * atr_mult
     if price > prevStop and pricePrev > prevStop:  # long regime
@@ -162,8 +162,10 @@ def compute_supertrend_like_trailing_stop(closes, atr, atr_mult=1.2):
 
 def compute_sma(values, length):
     """
-    Pine ta.sma equivalent.
+    Pine ta.sma equivalent for a fixed window.
     Returns list with None until enough data is present.
+    (Kept for possible future use; MA for latest bar is
+     now computed directly in build_metrics_from_ohlcv.)
     """
     n = len(values)
     sma = [None] * n
@@ -202,6 +204,10 @@ def compute_buy_signals(closes, trailing_stop):
 def build_metrics_from_ohlcv(times, opens, highs, lows, closes, volumes, is_crypto: bool):
     """
     Given full OHLCV arrays, compute all metrics needed for your strategy on the latest bar.
+    For MA:
+      - Crypto: target length = 240
+      - Stocks: target length = 825
+      - Younger assets: use effective_len = min(target_len, num_bars)
     """
     n = len(closes)
     if n == 0:
@@ -211,10 +217,6 @@ def build_metrics_from_ohlcv(times, opens, highs, lows, closes, volumes, is_cryp
     atr = compute_atr_rma(highs, lows, closes, length=10)
     trailing = compute_supertrend_like_trailing_stop(closes, atr, atr_mult=1.2)
     buys = compute_buy_signals(closes, trailing)
-
-    # 2) Long MA: 240 (crypto) vs 960 (stocks)
-    ma_length = 240 if is_crypto else 960
-    sma_long = compute_sma(closes, ma_length)
 
     idx = n - 1
     last_time = times[idx]
@@ -228,7 +230,14 @@ def build_metrics_from_ohlcv(times, opens, highs, lows, closes, volumes, is_cryp
     trailing_last = trailing[idx]
     buy_last = buys[idx]
 
-    sma_last = sma_long[idx]
+    # 2) Long MA: 240 (crypto) vs 825 (stocks), but allow shorter for young assets
+    target_ma_len = 240 if is_crypto else 825
+    effective_ma_len = min(target_ma_len, n)
+
+    # Always compute an MA on the latest bar using as many bars as we have (up to target_ma_len)
+    window_closes = closes[n - effective_ma_len : n]
+    sma_last = sum(window_closes) / effective_ma_len if effective_ma_len > 0 else None
+
     price_minus_ma = None
     pct_diff = None
     above_zone = None
@@ -242,7 +251,9 @@ def build_metrics_from_ohlcv(times, opens, highs, lows, closes, volumes, is_cryp
     if trailing_last is not None:
         long_regime = last_close > trailing_last
 
-    had_enough_history = sma_last is not None and atr_last is not None
+    # "Enough history" for status = OK is driven by ATR (10 bars),
+    # but MA-related columns are always filled as long as n >= 1.
+    had_enough_history = atr_last is not None
 
     return {
         "status": "OK" if had_enough_history else "INSUFFICIENT_HISTORY",
@@ -257,7 +268,9 @@ def build_metrics_from_ohlcv(times, opens, highs, lows, closes, volumes, is_cryp
         "trailing_stop": trailing_last,
         "long_regime": long_regime,
         "buy_signal": buy_last,
-        "ma_length": ma_length,
+        # this is the actual number of bars used in the MA,
+        # e.g. 825 for mature stocks, <825 for younger names
+        "ma_length": effective_ma_len,
         "long_sma": sma_last,
         "price_minus_ma": price_minus_ma,
         "pct_diff": pct_diff,
@@ -299,7 +312,7 @@ def fetch_alpaca_bars(symbol: str, is_crypto: bool, stock_client, crypto_client,
             limit=max_days,
         )
         bars = crypto_client.get_crypto_bars(req)
-        # new alpaca-py: bars.data[symbol] is list[Bar]
+        # alpaca-py: bars.data[symbol] is list[Bar]
         series = bars.data[symbol] if hasattr(bars, "data") else bars[symbol]
     else:
         req = StockBarsRequest(
@@ -427,7 +440,7 @@ def metrics_to_row(broker: str, symbol: str, is_crypto: bool, metrics: dict):
         metrics.get("trailing_stop", ""),
         "TRUE" if metrics.get("long_regime") else "FALSE" if metrics.get("long_regime") is not None else "",
         "TRUE" if metrics.get("buy_signal") else "FALSE" if metrics.get("buy_signal") is not None else "",
-        metrics.get("ma_length", ""),
+        metrics.get("ma_length", ""),   # effective MA window size actually used
         metrics.get("long_sma", ""),
         metrics.get("price_minus_ma", ""),
         metrics.get("pct_diff", ""),
@@ -494,7 +507,7 @@ def main():
     for sym in alpaca_symbols:
         is_crypto = sym in alpaca_crypto_symbols
         try:
-            max_days = 300 if is_crypto else 1200  # enough to warm ATR + 240/960 SMA
+            max_days = 300 if is_crypto else 1200  # enough to warm ATR + up to 825 bars for stocks
             times, o, h, l, c, v = fetch_alpaca_bars(sym, is_crypto, stock_client, crypto_client, max_days=max_days)
             metrics = build_metrics_from_ohlcv(times, o, h, l, c, v, is_crypto=is_crypto)
         except Exception as e:
@@ -509,7 +522,9 @@ def main():
             metrics = build_metrics_from_ohlcv(times, o, h, l, c, v, is_crypto=True)
         except Exception as e:
             metrics = {"status": f"ERROR: {e}"}
-        row = metrics_to_row("KRAKEN", pair, True, metrics)
+            row = metrics_to_row("KRAKEN", pair, True, metrics)
+        else:
+            row = metrics_to_row("KRAKEN", pair, True, metrics)
         rows.append(row)
 
     write_rows_to_sheet(ws, rows)
