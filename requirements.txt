@@ -1,0 +1,4 @@
+alpaca-py
+gspread
+google-auth
+requests
