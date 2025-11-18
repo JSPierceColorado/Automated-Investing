@@ -11,7 +11,7 @@ from google.oauth2.service_account import Credentials
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed  # ✅ use IEX instead of SIP
+from alpaca.data.enums import DataFeed  # use IEX instead of SIP
 
 
 # -----------------------------
@@ -299,7 +299,8 @@ def fetch_alpaca_bars(symbol: str, is_crypto: bool, stock_client, crypto_client,
             limit=max_days,
         )
         bars = crypto_client.get_crypto_bars(req)
-        series = bars[symbol]
+        # new alpaca-py: bars.data[symbol] is list[Bar]
+        series = bars.data[symbol] if hasattr(bars, "data") else bars[symbol]
     else:
         req = StockBarsRequest(
             symbol_or_symbols=[symbol],
@@ -307,10 +308,10 @@ def fetch_alpaca_bars(symbol: str, is_crypto: bool, stock_client, crypto_client,
             start=start,
             end=now,
             limit=max_days,
-            feed=DataFeed.IEX,  # ✅ force IEX feed, avoid SIP error
+            feed=DataFeed.IEX,  # force IEX, avoid SIP error
         )
         bars = stock_client.get_stock_bars(req)
-        series = bars[symbol]
+        series = bars.data[symbol] if hasattr(bars, "data") else bars[symbol]
 
     times = []
     opens = []
@@ -320,13 +321,13 @@ def fetch_alpaca_bars(symbol: str, is_crypto: bool, stock_client, crypto_client,
     volumes = []
 
     for bar in series:
-        # bars are dict-like: 't','o','h','l','c','v'
-        t = bar["t"]
-        o = safe_float(bar["o"])
-        h = safe_float(bar["h"])
-        l = safe_float(bar["l"])
-        c = safe_float(bar["c"])
-        v = safe_float(bar.get("v", 0.0))
+        # Bar objects have attributes, not dict keys
+        t = getattr(bar, "timestamp", None)
+        o = safe_float(getattr(bar, "open", None))
+        h = safe_float(getattr(bar, "high", None))
+        l = safe_float(getattr(bar, "low", None))
+        c = safe_float(getattr(bar, "close", None))
+        v = safe_float(getattr(bar, "volume", 0.0))
 
         times.append(str(t))
         opens.append(o)
