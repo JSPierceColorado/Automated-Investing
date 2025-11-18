@@ -11,6 +11,7 @@ from google.oauth2.service_account import Credentials
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed  # ✅ use IEX instead of SIP
 
 
 # -----------------------------
@@ -102,7 +103,7 @@ def compute_atr_rma(highs, lows, closes, length=10):
 
 def compute_supertrend_like_trailing_stop(closes, atr, atr_mult=1.2):
     """
-    Matches the SuperTrend-style trailing stop logic you described:
+    Matches the SuperTrend-style trailing stop logic:
 
     entryLoss = atr * atr_mult
     if price > prevStop and pricePrev > prevStop:  # long regime
@@ -306,6 +307,7 @@ def fetch_alpaca_bars(symbol: str, is_crypto: bool, stock_client, crypto_client,
             start=start,
             end=now,
             limit=max_days,
+            feed=DataFeed.IEX,  # ✅ force IEX feed, avoid SIP error
         )
         bars = stock_client.get_stock_bars(req)
         series = bars[symbol]
