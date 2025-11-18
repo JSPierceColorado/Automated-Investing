@@ -268,8 +268,7 @@ def build_metrics_from_ohlcv(times, opens, highs, lows, closes, volumes, is_cryp
         "trailing_stop": trailing_last,
         "long_regime": long_regime,
         "buy_signal": buy_last,
-        # this is the actual number of bars used in the MA,
-        # e.g. 825 for mature stocks, <825 for younger names
+        # actual number of bars used in the MA
         "ma_length": effective_ma_len,
         "long_sma": sma_last,
         "price_minus_ma": price_minus_ma,
@@ -477,7 +476,13 @@ def write_rows_to_sheet(ws, rows):
     ]
 
     data = [header] + rows
-    ws.clear()
+
+    # 🔧 IMPORTANT CHANGE:
+    # Clear ONLY columns A:V so that W onward (external functions / formulas)
+    # remain untouched.
+    ws.batch_clear(['A:V'])
+
+    # Now write our data starting at A1; this only fills columns A–V.
     ws.update("A1", data, value_input_option="RAW")
 
 
