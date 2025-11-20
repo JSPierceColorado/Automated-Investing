@@ -2,6 +2,7 @@ import os
 import json
 import sys
 import math
+import logging
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -15,20 +16,46 @@ from alpaca.data.enums import DataFeed, Adjustment  # use IEX instead of SIP; Ad
 
 
 # -----------------------------
+# Logging setup
+# -----------------------------
+
+logger = logging.getLogger(__name__)
+
+
+def configure_logging():
+    """
+    Configure logging (stdout) for Railway.
+    Controlled by LOG_LEVEL env var: DEBUG, INFO, WARNING, ERROR, CRITICAL.
+    Default is INFO.
+    """
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    logger.setLevel(level)
+    logger.info("Logging initialized at level %s", logging.getLevelName(level))
+
+
+# -----------------------------
 # Helpers / config
 # -----------------------------
 
 def get_env(name: str, default=None, required: bool = False):
     value = os.getenv(name, default)
-    if required and (value is None or value.strip() == ""):
-        print(f"Missing required environment variable: {name}", file=sys.stderr)
+    if required and (value is None or str(value).strip() == ""):
+        logger.error("Missing required environment variable: %s", name)
         sys.exit(1)
     return value
 
 
 def parse_symbol_list(env_var: str):
     raw = os.getenv(env_var, "")
-    return [s.strip() for s in raw.split(",") if s.strip()]
+    symbols = [s.strip() for s in raw.split(",") if s.strip()]
+    logger.debug("Parsed %d symbols from %s: %s", len(symbols), env_var, symbols)
+    return symbols
 
 
 def get_google_client():
@@ -40,6 +67,7 @@ def get_google_client():
         "https://www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
+    logger.info("Initialized Google client for Sheets/Drive")
     return gspread.authorize(creds)
 
 
@@ -47,12 +75,14 @@ def open_target_worksheet(gc):
     sheet_name = get_env("GOOGLE_SHEETS_SPREADSHEET_NAME", "Active-Investing")
     tab_name = get_env("GOOGLE_SHEETS_WORKSHEET_NAME", "Automation-Screener")
 
+    logger.info("Opening spreadsheet '%s', worksheet '%s'", sheet_name, tab_name)
     sh = gc.open(sheet_name)
 
     try:
         ws = sh.worksheet(tab_name)
+        logger.info("Found existing worksheet '%s'", tab_name)
     except gspread.exceptions.WorksheetNotFound:
-        # create if missing
+        logger.warning("Worksheet '%s' not found; creating it", tab_name)
         ws = sh.add_worksheet(title=tab_name, rows=1000, cols=30)
 
     return ws
@@ -211,6 +241,7 @@ def build_metrics_from_ohlcv(times, opens, highs, lows, closes, volumes, is_cryp
     """
     n = len(closes)
     if n == 0:
+        logger.warning("build_metrics_from_ohlcv called with no data (n=0)")
         return {"status": "NO_DATA"}
 
     # 1) ATR(10) and trailing stop
@@ -235,7 +266,7 @@ def build_metrics_from_ohlcv(times, opens, highs, lows, closes, volumes, is_cryp
     effective_ma_len = min(target_ma_len, n)
 
     # Always compute an MA on the latest bar using as many bars as we have (up to target_ma_len)
-    window_closes = closes[n - effective_ma_len : n]
+    window_closes = closes[n - effective_ma_len: n]
     sma_last = sum(window_closes) / effective_ma_len if effective_ma_len > 0 else None
 
     price_minus_ma = None
@@ -254,9 +285,25 @@ def build_metrics_from_ohlcv(times, opens, highs, lows, closes, volumes, is_cryp
     # "Enough history" for status = OK is driven by ATR (10 bars),
     # but MA-related columns are always filled as long as n >= 1.
     had_enough_history = atr_last is not None
+    status = "OK" if had_enough_history else "INSUFFICIENT_HISTORY"
+
+    logger.debug(
+        "Metrics (%s, bars=%d): status=%s last_close=%s atr_10=%s trailing=%s "
+        "long_regime=%s buy_signal=%s ma_len=%s pct_diff=%s",
+        "crypto" if is_crypto else "stock",
+        n,
+        status,
+        last_close,
+        atr_last,
+        trailing_last,
+        long_regime,
+        buy_last,
+        effective_ma_len,
+        pct_diff,
+    )
 
     return {
-        "status": "OK" if had_enough_history else "INSUFFICIENT_HISTORY",
+        "status": status,
         "last_time": last_time,
         "last_open": last_open,
         "last_high": last_high,
@@ -287,6 +334,7 @@ def get_alpaca_clients():
     api_key = get_env("ALPACA_API_KEY", required=True)
     api_secret = get_env("ALPACA_API_SECRET", required=True)
 
+    logger.info("Creating Alpaca stock & crypto clients")
     stock_client = StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)
     # crypto data does not need keys, but we can still pass them
     crypto_client = CryptoHistoricalDataClient()
@@ -301,6 +349,15 @@ def fetch_alpaca_bars(symbol: str, is_crypto: bool, stock_client, crypto_client,
     """
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=max_days)
+
+    logger.info(
+        "Fetching Alpaca bars for %s (crypto=%s, start=%s, end=%s, max_days=%d)",
+        symbol,
+        is_crypto,
+        start.isoformat(),
+        now.isoformat(),
+        max_days,
+    )
 
     if is_crypto:
         req = CryptoBarsRequest(
@@ -327,6 +384,17 @@ def fetch_alpaca_bars(symbol: str, is_crypto: bool, stock_client, crypto_client,
         )
         bars = stock_client.get_stock_bars(req)
         series = bars.data[symbol] if hasattr(bars, "data") else bars[symbol]
+
+    num_bars = len(series)
+    logger.info("Alpaca returned %d bars for %s", num_bars, symbol)
+
+    if num_bars == 0:
+        logger.warning("No Alpaca data returned for %s", symbol)
+    elif num_bars < max_days:
+        logger.info(
+            "%s returned fewer bars (%d) than max_days (%d) – likely limited by asset history or API.",
+            symbol, num_bars, max_days
+        )
 
     times = []
     opens = []
@@ -370,11 +438,19 @@ def fetch_kraken_ohlc(pair: str, max_days: int):
         "interval": 1440,
     }
 
+    logger.info("Fetching Kraken OHLC for %s (max_days=%d)", pair, max_days)
+
     resp = requests.get(url, params=params, timeout=15)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except Exception:
+        logger.exception("HTTP error from Kraken for %s. Body (truncated): %s", pair, resp.text[:500])
+        raise
+
     data = resp.json()
 
     if data.get("error"):
+        logger.error("Kraken error for %s: %s", pair, data["error"])
         raise RuntimeError(f"Kraken error for {pair}: {data['error']}")
 
     result = data["result"]
@@ -386,10 +462,18 @@ def fetch_kraken_ohlc(pair: str, max_days: int):
             break
 
     if series_key is None:
+        logger.error("No OHLC series in Kraken result for %s", pair)
         raise RuntimeError(f"No OHLC series in Kraken result for {pair}")
 
     raw_series = result[series_key]
-    if len(raw_series) > max_days:
+    raw_len = len(raw_series)
+    logger.info("Kraken returned %d raw OHLC rows for %s", raw_len, pair)
+
+    if raw_len > max_days:
+        logger.info(
+            "Slicing Kraken data for %s from %d to last %d entries",
+            pair, raw_len, max_days
+        )
         raw_series = raw_series[-max_days:]
 
     times = []
@@ -480,6 +564,15 @@ def write_rows_to_sheet(ws, rows):
 
     data = [header] + rows
 
+    logger.info(
+        "Writing %d data rows (%d including header) to sheet '%s' (A:V)",
+        len(rows),
+        len(data),
+        ws.title,
+    )
+    if rows:
+        logger.debug("First data row: %s", rows[0])
+
     # 🔧 IMPORTANT:
     # Clear ONLY columns A:V so that W onward (external functions / formulas)
     # remain untouched.
@@ -487,6 +580,7 @@ def write_rows_to_sheet(ws, rows):
 
     # Now write our data starting at A1; this only fills columns A–V.
     ws.update("A1", data, value_input_option="RAW")
+    logger.info("Sheet update complete.")
 
 
 # -----------------------------
@@ -494,14 +588,28 @@ def write_rows_to_sheet(ws, rows):
 # -----------------------------
 
 def main():
+    configure_logging()
+    logger.info("=== Screener run started ===")
+
     alpaca_symbols = parse_symbol_list("ALPACA_WHITELIST")
     kraken_symbols = parse_symbol_list("KRAKEN_WHITELIST")
 
     if not alpaca_symbols and not kraken_symbols:
+        logger.error("No symbols configured. Set ALPACA_WHITELIST and/or KRAKEN_WHITELIST.")
         print("No symbols configured. Set ALPACA_WHITELIST and/or KRAKEN_WHITELIST.", file=sys.stderr)
         sys.exit(1)
 
     alpaca_crypto_symbols = set(parse_symbol_list("ALPACA_CRYPTO_SYMBOLS"))
+
+    logger.info(
+        "Configured symbols – Alpaca: %d (%s), Kraken: %d (%s), Alpaca-crypto: %d (%s)",
+        len(alpaca_symbols),
+        alpaca_symbols,
+        len(kraken_symbols),
+        kraken_symbols,
+        len(alpaca_crypto_symbols),
+        list(alpaca_crypto_symbols),
+    )
 
     # Clients
     gc = get_google_client()
@@ -510,32 +618,59 @@ def main():
     stock_client, crypto_client = get_alpaca_clients()
 
     rows = []
+    error_count = 0
 
     # Alpaca symbols
     for sym in alpaca_symbols:
         is_crypto = sym in alpaca_crypto_symbols
         try:
             max_days = 300 if is_crypto else 1200  # enough to warm ATR + up to 825 bars for stocks
-            times, o, h, l, c, v = fetch_alpaca_bars(sym, is_crypto, stock_client, crypto_client, max_days=max_days)
+            logger.info("Processing ALPACA %s (crypto=%s, max_days=%d)", sym, is_crypto, max_days)
+
+            times, o, h, l, c, v = fetch_alpaca_bars(
+                sym, is_crypto, stock_client, crypto_client, max_days=max_days
+            )
             metrics = build_metrics_from_ohlcv(times, o, h, l, c, v, is_crypto=is_crypto)
+            logger.info(
+                "Finished ALPACA %s: status=%s, num_bars=%s",
+                sym,
+                metrics.get("status"),
+                metrics.get("num_bars"),
+            )
         except Exception as e:
+            error_count += 1
+            logger.exception("Error processing ALPACA symbol %s", sym)
             metrics = {"status": f"ERROR: {e}"}
+
         row = metrics_to_row("ALPACA", sym, is_crypto, metrics)
         rows.append(row)
 
     # Kraken symbols (all crypto)
     for pair in kraken_symbols:
         try:
+            logger.info("Processing KRAKEN %s", pair)
             times, o, h, l, c, v = fetch_kraken_ohlc(pair, max_days=300)
             metrics = build_metrics_from_ohlcv(times, o, h, l, c, v, is_crypto=True)
+            logger.info(
+                "Finished KRAKEN %s: status=%s, num_bars=%s",
+                pair,
+                metrics.get("status"),
+                metrics.get("num_bars"),
+            )
         except Exception as e:
+            error_count += 1
+            logger.exception("Error processing KRAKEN pair %s", pair)
             metrics = {"status": f"ERROR: {e}"}
-            row = metrics_to_row("KRAKEN", pair, True, metrics)
-        else:
-            row = metrics_to_row("KRAKEN", pair, True, metrics)
+
+        row = metrics_to_row("KRAKEN", pair, True, metrics)
         rows.append(row)
 
     write_rows_to_sheet(ws, rows)
+    logger.info(
+        "=== Screener run complete. Wrote %d rows (errors: %d) ===",
+        len(rows),
+        error_count,
+    )
     print(f"Wrote {len(rows)} rows to sheet.")
 
 
