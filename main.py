@@ -13,6 +13,9 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed, Adjustment
 
+# Used only for market clock check
+from alpaca.trading.client import TradingClient
+
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,10 @@ def get_env(name: str, default=None, required: bool = False):
         logger.error("Missing required environment variable: %s", name)
         sys.exit(1)
     return value
+
+
+def truthy(x) -> bool:
+    return str(x).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def parse_symbol_list(env_var: str):
@@ -72,7 +79,16 @@ def col_letter(n: int) -> str:
     return s
 
 
+def mean_ignore_none(vals):
+    xs = [x for x in vals if x is not None and not (isinstance(x, float) and math.isnan(x))]
+    return (sum(xs) / len(xs)) if xs else None
+
+
 def drop_bad_rows(times, o, h, l, c, v, vwap, tc):
+    """
+    Drop rows where OHLC is missing.
+    Keep volume/vwap/trade_count as None if missing (do NOT coerce to 0).
+    """
     nt, no, nh, nl, nc, nv, nvw, ntc = [], [], [], [], [], [], [], []
     for t, oo, hh, ll, cc, vv, vw, tcc in zip(times, o, h, l, c, v, vwap, tc):
         if any(is_bad_num(x) for x in (oo, hh, ll, cc)):
@@ -82,10 +98,28 @@ def drop_bad_rows(times, o, h, l, c, v, vwap, tc):
         nh.append(hh)
         nl.append(ll)
         nc.append(cc)
-        nv.append(0.0 if is_bad_num(vv) else vv)
+        nv.append(None if is_bad_num(vv) else vv)
         nvw.append(None if is_bad_num(vw) else vw)
         ntc.append(None if is_bad_num(tcc) else tcc)
     return nt, no, nh, nl, nc, nv, nvw, ntc
+
+
+def is_blank_or_zero(v) -> bool:
+    # blank string
+    if isinstance(v, str):
+        return v.strip() == ""
+
+    # None / NaN
+    if v is None:
+        return True
+    if isinstance(v, float) and math.isnan(v):
+        return True
+
+    # numeric 0
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v == 0
+
+    return False
 
 
 # -----------------------------
@@ -126,12 +160,39 @@ def write_rows_to_sheet(ws, header, rows):
 
 
 # -----------------------------
-# Alpaca fetch
+# Alpaca clients / market open check
 # -----------------------------
-def get_alpaca_client():
+def get_alpaca_data_client():
     api_key = get_env("ALPACA_API_KEY", required=True)
     api_secret = get_env("ALPACA_API_SECRET", required=True)
     return StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)
+
+
+def market_is_open_or_exit():
+    """
+    If RUN_ONLY_WHEN_MARKET_OPEN=true (default), check Alpaca market clock.
+    Exit(0) if market is closed.
+    """
+    if not truthy(get_env("RUN_ONLY_WHEN_MARKET_OPEN", "true")):
+        logger.info("RUN_ONLY_WHEN_MARKET_OPEN disabled; continuing.")
+        return
+
+    api_key = get_env("ALPACA_API_KEY", required=True)
+    api_secret = get_env("ALPACA_API_SECRET", required=True)
+    paper = truthy(get_env("ALPACA_PAPER", "true"))
+
+    try:
+        tc = TradingClient(api_key=api_key, secret_key=api_secret, paper=paper)
+        clock = tc.get_clock()
+        if not getattr(clock, "is_open", False):
+            logger.info("Market is CLOSED. Exiting.")
+            print("Market closed; exiting.")
+            sys.exit(0)
+        logger.info("Market is OPEN. Proceeding.")
+    except Exception:
+        logger.exception("Failed to check market clock; exiting to avoid running outside market hours.")
+        print("Could not confirm market open; exiting (check Alpaca keys / ALPACA_PAPER).")
+        sys.exit(0)
 
 
 def fetch_stock_bars(stock_client, symbol: str, calendar_days: int):
@@ -143,7 +204,7 @@ def fetch_stock_bars(stock_client, symbol: str, calendar_days: int):
         timeframe=TimeFrame.Day,
         start=start,
         end=now,
-        limit=calendar_days,  # limit is count; OK
+        limit=calendar_days,
         feed=DataFeed.IEX,
         adjustment=Adjustment.SPLIT,
     )
@@ -184,7 +245,6 @@ def fetch_latest_trade_and_quote(stock_client, symbol: str):
         trade = tr.data.get(symbol) if hasattr(tr, "data") else tr.get(symbol)
         if trade:
             out["last_trade_price"] = safe_float(getattr(trade, "price", None))
-            # NOTE: intentionally not returning last_trade_time (user requested removal)
     except Exception:
         logger.debug("Latest trade unavailable for %s", symbol, exc_info=True)
 
@@ -237,43 +297,16 @@ def atr_wilder_last(highs, lows, closes, length: int = 14):
     return atr
 
 
-def volatility_annualized_pct(closes, length: int = 20):
-    n = len(closes)
-    if n < 2:
-        return None
-    use = min(length, n - 1)
-    rets = []
-    for i in range(n - use, n):
-        prev = closes[i - 1]
-        cur = closes[i]
-        if prev == 0:
-            continue
-        rets.append((cur / prev) - 1.0)
-    if len(rets) < 2:
-        return None
-    mean = sum(rets) / len(rets)
-    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
-    daily_sd = math.sqrt(var)
-    ann = daily_sd * math.sqrt(252.0)
-    return ann * 100.0
-
-
-def build_metrics(times, opens, highs, lows, closes, volumes, vwaps, trade_counts):
+def build_metrics(opens, highs, lows, closes, volumes, vwaps, trade_counts):
     n = len(closes)
     if n == 0:
         return {"ok": False}
 
     last_close = closes[-1]
     prev_close = closes[-2] if n >= 2 else None
-    chg_1d_pct = None
-    if prev_close not in (None, 0):
-        chg_1d_pct = ((last_close / prev_close) - 1.0) * 100.0
 
     sma50 = sma_last(closes, 50)
     sma200 = sma_last(closes, 200)
-
-    pct_from_sma50 = None if (sma50 in (None, 0)) else ((last_close / sma50) - 1.0) * 100.0
-    pct_from_sma200 = None if (sma200 in (None, 0)) else ((last_close / sma200) - 1.0) * 100.0
 
     atr14 = atr_wilder_last(highs, lows, closes, 14)
 
@@ -282,41 +315,58 @@ def build_metrics(times, opens, highs, lows, closes, volumes, vwaps, trade_count
     high_52w = max(window) if window else None
     low_52w = min(window) if window else None
 
-    pct_off_52w_high = None if (high_52w in (None, 0)) else ((last_close / high_52w) - 1.0) * 100.0
-    pct_above_52w_low = None if (low_52w in (None, 0)) else ((last_close / low_52w) - 1.0) * 100.0
-
     use_20 = min(20, n)
     vol20 = volumes[-use_20:] if use_20 > 0 else []
     close20 = closes[-use_20:] if use_20 > 0 else []
-    avg_vol_20d = (sum(vol20) / use_20) if use_20 > 0 else None
-    avg_close_20d = (sum(close20) / use_20) if use_20 > 0 else None
+
+    avg_vol_20d = mean_ignore_none(vol20)
+    avg_close_20d = mean_ignore_none(close20)
+
     avg_dollar_vol_20d = None
     if avg_vol_20d is not None and avg_close_20d is not None:
         avg_dollar_vol_20d = avg_vol_20d * avg_close_20d
-
-    vol_20d_ann = volatility_annualized_pct(closes, 20)
 
     return {
         "ok": True,
         "close": last_close,
         "prev_close": prev_close,
-        "change_1d_pct": chg_1d_pct,
         "volume": volumes[-1],
         "vwap": vwaps[-1],
         "trade_count": trade_counts[-1],
         "sma_50": sma50,
         "sma_200": sma200,
-        "pct_from_sma_50": pct_from_sma50,
-        "pct_from_sma_200": pct_from_sma200,
         "atr_14": atr14,
         "high_52w": high_52w,
         "low_52w": low_52w,
-        "pct_off_52w_high": pct_off_52w_high,
-        "pct_above_52w_low": pct_above_52w_low,
         "avg_volume_20d": avg_vol_20d,
         "avg_dollar_volume_20d": avg_dollar_vol_20d,
-        "volatility_20d_ann_pct": vol_20d_ann,
         "num_bars": n,
+    }
+
+
+def required_fields_for_drop(sym: str, metrics: dict):
+    """
+    Drop symbol if ANY of these are blank OR 0:
+      symbol, close, prev_close, volume, vwap, trade_count, sma_50, sma_200,
+      atr_14, high_52w, low_52w, avg_volume_20d, avg_dollar_volume_20d, num_bars
+
+    NOTE: last_trade_price, bid, ask, spread_pct are NOT required (allowed missing/0).
+    """
+    return {
+        "symbol": sym,
+        "close": metrics.get("close"),
+        "prev_close": metrics.get("prev_close"),
+        "volume": metrics.get("volume"),
+        "vwap": metrics.get("vwap"),
+        "trade_count": metrics.get("trade_count"),
+        "sma_50": metrics.get("sma_50"),
+        "sma_200": metrics.get("sma_200"),
+        "atr_14": metrics.get("atr_14"),
+        "high_52w": metrics.get("high_52w"),
+        "low_52w": metrics.get("low_52w"),
+        "avg_volume_20d": metrics.get("avg_volume_20d"),
+        "avg_dollar_volume_20d": metrics.get("avg_dollar_volume_20d"),
+        "num_bars": metrics.get("num_bars"),
     }
 
 
@@ -326,6 +376,9 @@ def build_metrics(times, opens, highs, lows, closes, volumes, vwaps, trade_count
 def main():
     configure_logging()
     logger.info("=== Alpaca Stocks Screener run started ===")
+
+    # Only run when market is open (default true)
+    market_is_open_or_exit()
 
     symbols = parse_symbol_list("ALPACA_WHITELIST")
     if not symbols:
@@ -337,97 +390,91 @@ def main():
     gc = get_google_client()
     ws = open_target_worksheet(gc)
 
-    stock_client = get_alpaca_client()
+    stock_client = get_alpaca_data_client()
 
-    # Removed: status, last_bar_time, last_trade_time, asset_* meta columns
+    # Keeping the live fields, but they are allowed blank/0 now
     header = [
         "symbol",
         "close",
         "prev_close",
-        "change_1d_pct",
         "volume",
         "vwap",
         "trade_count",
         "sma_50",
         "sma_200",
-        "pct_from_sma_50",
-        "pct_from_sma_200",
         "atr_14",
         "high_52w",
         "low_52w",
-        "pct_off_52w_high",
-        "pct_above_52w_low",
         "avg_volume_20d",
         "avg_dollar_volume_20d",
-        "volatility_20d_ann_pct",
         "last_trade_price",
         "bid",
         "ask",
         "spread_pct",
         "num_bars",
-        "error",  # keeps runs debuggable without a "status" column
     ]
 
     rows = []
-    errors = 0
+    dropped = 0
 
     for sym in symbols:
         try:
             logger.info("Processing %s", sym)
             times, o, h, l, c, v, vwap, tc = fetch_stock_bars(stock_client, sym, calendar_days)
-            metrics = build_metrics(times, o, h, l, c, v, vwap, tc)
+            metrics = build_metrics(o, h, l, c, v, vwap, tc)
+            if not metrics.get("ok"):
+                dropped += 1
+                logger.warning("Dropping %s (no data)", sym)
+                continue
 
             live = fetch_latest_trade_and_quote(stock_client, sym)
             bid = live.get("bid")
             ask = live.get("ask")
+
             spread_pct = None
             if bid is not None and ask is not None and ask != 0:
                 spread_pct = ((ask - bid) / ask) * 100.0
 
-            if not metrics.get("ok"):
-                row = [sym] + [""] * (len(header) - 2) + ["NO_DATA"]
-                rows.append(row)
+            req = required_fields_for_drop(sym, metrics)
+            missing = [k for k, v in req.items() if is_blank_or_zero(v)]
+            if missing:
+                dropped += 1
+                logger.warning("Dropping %s due to blank/0 in: %s", sym, ",".join(missing))
                 continue
 
             row = [
                 sym,
                 metrics.get("close"),
                 metrics.get("prev_close"),
-                metrics.get("change_1d_pct"),
                 metrics.get("volume"),
                 metrics.get("vwap"),
                 metrics.get("trade_count"),
                 metrics.get("sma_50"),
                 metrics.get("sma_200"),
-                metrics.get("pct_from_sma_50"),
-                metrics.get("pct_from_sma_200"),
                 metrics.get("atr_14"),
                 metrics.get("high_52w"),
                 metrics.get("low_52w"),
-                metrics.get("pct_off_52w_high"),
-                metrics.get("pct_above_52w_low"),
                 metrics.get("avg_volume_20d"),
                 metrics.get("avg_dollar_volume_20d"),
-                metrics.get("volatility_20d_ann_pct"),
                 live.get("last_trade_price"),
                 bid,
                 ask,
                 spread_pct,
                 metrics.get("num_bars"),
-                "",  # error
             ]
 
             rows.append([sheet_val(x) for x in row])
 
-        except Exception as e:
-            errors += 1
-            logger.exception("Error processing %s", sym)
-            # Put symbol + blanks + error message
-            rows.append([sym] + [""] * (len(header) - 2) + [str(e)])
+        except Exception:
+            dropped += 1
+            logger.exception("Dropping %s due to exception", sym)
+            continue
+
+    rows.sort(key=lambda r: str(r[0]))
 
     write_rows_to_sheet(ws, header, rows)
-    logger.info("=== Complete. Wrote %d rows (errors: %d) ===", len(rows), errors)
-    print(f"Wrote {len(rows)} rows to sheet. Errors: {errors}")
+    logger.info("=== Complete. Wrote %d rows. Dropped: %d ===", len(rows), dropped)
+    print(f"Wrote {len(rows)} rows to sheet. Dropped: {dropped}.")
 
 
 if __name__ == "__main__":
