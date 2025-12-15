@@ -2,6 +2,7 @@ import os
 import json
 import sys
 import math
+import time
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -168,31 +169,35 @@ def get_alpaca_data_client():
     return StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)
 
 
-def market_is_open_or_exit():
-    """
-    If RUN_ONLY_WHEN_MARKET_OPEN=true (default), check Alpaca market clock.
-    Exit(0) if market is closed.
-    """
-    if not truthy(get_env("RUN_ONLY_WHEN_MARKET_OPEN", "true")):
-        logger.info("RUN_ONLY_WHEN_MARKET_OPEN disabled; continuing.")
-        return
-
+def get_market_clock():
     api_key = get_env("ALPACA_API_KEY", required=True)
     api_secret = get_env("ALPACA_API_SECRET", required=True)
     paper = truthy(get_env("ALPACA_PAPER", "true"))
+    tc = TradingClient(api_key=api_key, secret_key=api_secret, paper=paper)
+    return tc.get_clock()
+
+
+def market_is_open() -> bool:
+    """
+    Returns True only if we can confirm the market is open.
+    If clock check fails, we treat it as closed (fail-closed).
+    """
+    if not truthy(get_env("RUN_ONLY_WHEN_MARKET_OPEN", "true")):
+        return True
 
     try:
-        tc = TradingClient(api_key=api_key, secret_key=api_secret, paper=paper)
-        clock = tc.get_clock()
-        if not getattr(clock, "is_open", False):
-            logger.info("Market is CLOSED. Exiting.")
-            print("Market closed; exiting.")
-            sys.exit(0)
-        logger.info("Market is OPEN. Proceeding.")
+        clock = get_market_clock()
+        is_open = bool(getattr(clock, "is_open", False))
+        if not is_open:
+            logger.info("Market CLOSED. next_open=%s next_close=%s",
+                        getattr(clock, "next_open", None),
+                        getattr(clock, "next_close", None))
+        else:
+            logger.info("Market OPEN. next_close=%s", getattr(clock, "next_close", None))
+        return is_open
     except Exception:
-        logger.exception("Failed to check market clock; exiting to avoid running outside market hours.")
-        print("Could not confirm market open; exiting (check Alpaca keys / ALPACA_PAPER).")
-        sys.exit(0)
+        logger.exception("Failed to check market clock (treating as closed).")
+        return False
 
 
 def fetch_stock_bars(stock_client, symbol: str, calendar_days: int):
@@ -230,8 +235,8 @@ def fetch_stock_bars(stock_client, symbol: str, calendar_days: int):
 
 def fetch_latest_trade_and_quote(stock_client, symbol: str):
     """
-    Optional: latest trade & quote. If your alpaca-py version lacks these request classes
-    or you don't have access, we just return {}.
+    Optional: latest trade & quote.
+    Allowed to be missing/0 (we do NOT drop based on these fields).
     """
     out = {}
     try:
@@ -307,7 +312,6 @@ def build_metrics(opens, highs, lows, closes, volumes, vwaps, trade_counts):
 
     sma50 = sma_last(closes, 50)
     sma200 = sma_last(closes, 200)
-
     atr14 = atr_wilder_last(highs, lows, closes, 14)
 
     use_252 = min(252, n)
@@ -350,7 +354,7 @@ def required_fields_for_drop(sym: str, metrics: dict):
       symbol, close, prev_close, volume, vwap, trade_count, sma_50, sma_200,
       atr_14, high_52w, low_52w, avg_volume_20d, avg_dollar_volume_20d, num_bars
 
-    NOTE: last_trade_price, bid, ask, spread_pct are NOT required (allowed missing/0).
+    NOTE: last_trade_price, bid, ask, spread_pct are allowed missing/0.
     """
     return {
         "symbol": sym,
@@ -371,19 +375,13 @@ def required_fields_for_drop(sym: str, metrics: dict):
 
 
 # -----------------------------
-# Main
+# One full run (single pass over whitelist)
 # -----------------------------
-def main():
-    configure_logging()
-    logger.info("=== Alpaca Stocks Screener run started ===")
-
-    # Only run when market is open (default true)
-    market_is_open_or_exit()
-
+def run_once():
     symbols = parse_symbol_list("ALPACA_WHITELIST")
     if not symbols:
         logger.error("No symbols configured. Set ALPACA_WHITELIST.")
-        sys.exit(1)
+        return
 
     calendar_days = int(get_env("ALPACA_STOCK_CALENDAR_DAYS", 2200))
 
@@ -392,7 +390,6 @@ def main():
 
     stock_client = get_alpaca_data_client()
 
-    # Keeping the live fields, but they are allowed blank/0 now
     header = [
         "symbol",
         "close",
@@ -427,10 +424,10 @@ def main():
                 logger.warning("Dropping %s (no data)", sym)
                 continue
 
+            # live fields allowed missing/0
             live = fetch_latest_trade_and_quote(stock_client, sym)
             bid = live.get("bid")
             ask = live.get("ask")
-
             spread_pct = None
             if bid is not None and ask is not None and ask != 0:
                 spread_pct = ((ask - bid) / ask) * 100.0
@@ -462,7 +459,6 @@ def main():
                 spread_pct,
                 metrics.get("num_bars"),
             ]
-
             rows.append([sheet_val(x) for x in row])
 
         except Exception:
@@ -471,10 +467,41 @@ def main():
             continue
 
     rows.sort(key=lambda r: str(r[0]))
-
     write_rows_to_sheet(ws, header, rows)
-    logger.info("=== Complete. Wrote %d rows. Dropped: %d ===", len(rows), dropped)
-    print(f"Wrote {len(rows)} rows to sheet. Dropped: {dropped}.")
+
+    logger.info("Run complete. Wrote %d rows. Dropped: %d.", len(rows), dropped)
+
+
+# -----------------------------
+# Main loop (perpetual)
+# -----------------------------
+def main():
+    configure_logging()
+    logger.info("=== Alpaca Stocks Screener (perpetual) started ===")
+
+    poll_seconds = int(get_env("MARKET_POLL_SECONDS", 60))          # check once per minute
+    post_run_sleep = int(get_env("POST_RUN_SLEEP_SECONDS", 60))     # small pause after run
+
+    while True:
+        try:
+            if not market_is_open():
+                time.sleep(poll_seconds)
+                continue
+
+            started = datetime.now(timezone.utc)
+            logger.info("Starting run_once() at %s", started.isoformat())
+            run_once()
+            ended = datetime.now(timezone.utc)
+            dur = (ended - started).total_seconds()
+            logger.info("run_once() finished at %s (duration %.1f sec)", ended.isoformat(), dur)
+
+            # After the long run, just pause briefly then loop back (will re-check open)
+            time.sleep(post_run_sleep)
+
+        except Exception:
+            # Don't die; log and keep looping
+            logger.exception("Top-level loop exception; sleeping then continuing.")
+            time.sleep(poll_seconds)
 
 
 if __name__ == "__main__":
