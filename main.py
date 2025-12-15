@@ -13,9 +13,6 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed, Adjustment
 
-# Trading (asset metadata)
-from alpaca.trading.client import TradingClient
-
 
 logger = logging.getLogger(__name__)
 
@@ -131,13 +128,10 @@ def write_rows_to_sheet(ws, header, rows):
 # -----------------------------
 # Alpaca fetch
 # -----------------------------
-def get_alpaca_clients():
+def get_alpaca_client():
     api_key = get_env("ALPACA_API_KEY", required=True)
     api_secret = get_env("ALPACA_API_SECRET", required=True)
-
-    stock_data = StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)
-    trading = TradingClient(api_key=api_key, secret_key=api_secret, paper=True)  # paper flag is fine for metadata
-    return stock_data, trading
+    return StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)
 
 
 def fetch_stock_bars(stock_client, symbol: str, calendar_days: int):
@@ -149,7 +143,7 @@ def fetch_stock_bars(stock_client, symbol: str, calendar_days: int):
         timeframe=TimeFrame.Day,
         start=start,
         end=now,
-        limit=calendar_days,          # limit is count, not days; this is fine
+        limit=calendar_days,  # limit is count; OK
         feed=DataFeed.IEX,
         adjustment=Adjustment.SPLIT,
     )
@@ -190,8 +184,7 @@ def fetch_latest_trade_and_quote(stock_client, symbol: str):
         trade = tr.data.get(symbol) if hasattr(tr, "data") else tr.get(symbol)
         if trade:
             out["last_trade_price"] = safe_float(getattr(trade, "price", None))
-            tt = getattr(trade, "timestamp", None)
-            out["last_trade_time"] = tt.isoformat() if hasattr(tt, "isoformat") else str(tt)
+            # NOTE: intentionally not returning last_trade_time (user requested removal)
     except Exception:
         logger.debug("Latest trade unavailable for %s", symbol, exc_info=True)
 
@@ -205,22 +198,6 @@ def fetch_latest_trade_and_quote(stock_client, symbol: str):
     except Exception:
         logger.debug("Latest quote unavailable for %s", symbol, exc_info=True)
 
-    return out
-
-
-def fetch_asset_meta(trading_client, symbol: str):
-    out = {}
-    try:
-        a = trading_client.get_asset(symbol)
-        out["asset_name"] = getattr(a, "name", "")
-        out["exchange"] = getattr(a, "exchange", "")
-        out["tradable"] = getattr(a, "tradable", None)
-        out["marginable"] = getattr(a, "marginable", None)
-        out["shortable"] = getattr(a, "shortable", None)
-        out["fractionable"] = getattr(a, "fractionable", None)
-        out["easy_to_borrow"] = getattr(a, "easy_to_borrow", None)
-    except Exception as e:
-        logger.debug("Asset meta unavailable for %s (%s)", symbol, e, exc_info=True)
     return out
 
 
@@ -241,7 +218,6 @@ def atr_wilder_last(highs, lows, closes, length: int = 14):
     if n < 2:
         return None
 
-    # True Range
     tr = []
     for i in range(n):
         if i == 0:
@@ -255,7 +231,6 @@ def atr_wilder_last(highs, lows, closes, length: int = 14):
     if n < length:
         return None
 
-    # Seed with SMA
     atr = sum(tr[:length]) / length
     for i in range(length, n):
         atr = (atr * (length - 1) + tr[i]) / length
@@ -267,7 +242,6 @@ def volatility_annualized_pct(closes, length: int = 20):
     if n < 2:
         return None
     use = min(length, n - 1)
-    # simple returns over last `use` days
     rets = []
     for i in range(n - use, n):
         prev = closes[i - 1]
@@ -287,7 +261,7 @@ def volatility_annualized_pct(closes, length: int = 20):
 def build_metrics(times, opens, highs, lows, closes, volumes, vwaps, trade_counts):
     n = len(closes)
     if n == 0:
-        return {"status": "NO_DATA"}
+        return {"ok": False}
 
     last_close = closes[-1]
     prev_close = closes[-2] if n >= 2 else None
@@ -303,7 +277,6 @@ def build_metrics(times, opens, highs, lows, closes, volumes, vwaps, trade_count
 
     atr14 = atr_wilder_last(highs, lows, closes, 14)
 
-    # 52-week high/low ~ 252 trading days (use what we have)
     use_252 = min(252, n)
     window = closes[-use_252:]
     high_52w = max(window) if window else None
@@ -312,7 +285,6 @@ def build_metrics(times, opens, highs, lows, closes, volumes, vwaps, trade_count
     pct_off_52w_high = None if (high_52w in (None, 0)) else ((last_close / high_52w) - 1.0) * 100.0
     pct_above_52w_low = None if (low_52w in (None, 0)) else ((last_close / low_52w) - 1.0) * 100.0
 
-    # avg vol / avg dollar vol (20d)
     use_20 = min(20, n)
     vol20 = volumes[-use_20:] if use_20 > 0 else []
     close20 = closes[-use_20:] if use_20 > 0 else []
@@ -325,8 +297,7 @@ def build_metrics(times, opens, highs, lows, closes, volumes, vwaps, trade_count
     vol_20d_ann = volatility_annualized_pct(closes, 20)
 
     return {
-        "status": "OK",
-        "last_bar_time": times[-1],
+        "ok": True,
         "close": last_close,
         "prev_close": prev_close,
         "change_1d_pct": chg_1d_pct,
@@ -361,18 +332,16 @@ def main():
         logger.error("No symbols configured. Set ALPACA_WHITELIST.")
         sys.exit(1)
 
-    # Pull enough calendar days to reliably cover 252 trading bars + SMAs
     calendar_days = int(get_env("ALPACA_STOCK_CALENDAR_DAYS", 2200))
 
     gc = get_google_client()
     ws = open_target_worksheet(gc)
 
-    stock_client, trading_client = get_alpaca_clients()
+    stock_client = get_alpaca_client()
 
+    # Removed: status, last_bar_time, last_trade_time, asset_* meta columns
     header = [
-        "status",
         "symbol",
-        "last_bar_time",
         "close",
         "prev_close",
         "change_1d_pct",
@@ -392,18 +361,11 @@ def main():
         "avg_dollar_volume_20d",
         "volatility_20d_ann_pct",
         "last_trade_price",
-        "last_trade_time",
         "bid",
         "ask",
         "spread_pct",
-        "asset_name",
-        "exchange",
-        "tradable",
-        "marginable",
-        "shortable",
-        "fractionable",
-        "easy_to_borrow",
         "num_bars",
+        "error",  # keeps runs debuggable without a "status" column
     ]
 
     rows = []
@@ -416,18 +378,19 @@ def main():
             metrics = build_metrics(times, o, h, l, c, v, vwap, tc)
 
             live = fetch_latest_trade_and_quote(stock_client, sym)
-            meta = fetch_asset_meta(trading_client, sym)
-
             bid = live.get("bid")
             ask = live.get("ask")
             spread_pct = None
             if bid is not None and ask is not None and ask != 0:
                 spread_pct = ((ask - bid) / ask) * 100.0
 
+            if not metrics.get("ok"):
+                row = [sym] + [""] * (len(header) - 2) + ["NO_DATA"]
+                rows.append(row)
+                continue
+
             row = [
-                metrics.get("status", ""),
                 sym,
-                metrics.get("last_bar_time", ""),
                 metrics.get("close"),
                 metrics.get("prev_close"),
                 metrics.get("change_1d_pct"),
@@ -447,18 +410,11 @@ def main():
                 metrics.get("avg_dollar_volume_20d"),
                 metrics.get("volatility_20d_ann_pct"),
                 live.get("last_trade_price"),
-                live.get("last_trade_time"),
                 bid,
                 ask,
                 spread_pct,
-                meta.get("asset_name", ""),
-                meta.get("exchange", ""),
-                meta.get("tradable"),
-                meta.get("marginable"),
-                meta.get("shortable"),
-                meta.get("fractionable"),
-                meta.get("easy_to_borrow"),
                 metrics.get("num_bars"),
+                "",  # error
             ]
 
             rows.append([sheet_val(x) for x in row])
@@ -466,7 +422,8 @@ def main():
         except Exception as e:
             errors += 1
             logger.exception("Error processing %s", sym)
-            rows.append(["ERROR", sym] + [""] * (len(header) - 2))
+            # Put symbol + blanks + error message
+            rows.append([sym] + [""] * (len(header) - 2) + [str(e)])
 
     write_rows_to_sheet(ws, header, rows)
     logger.info("=== Complete. Wrote %d rows (errors: %d) ===", len(rows), errors)
