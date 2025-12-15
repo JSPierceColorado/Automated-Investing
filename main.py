@@ -5,44 +5,35 @@ import math
 import logging
 from datetime import datetime, timedelta, timezone
 
-import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed, Adjustment  # use IEX instead of SIP; Adjustment for split-adjusted bars
+from alpaca.data.enums import DataFeed, Adjustment
 
+# Trading (asset metadata)
+from alpaca.trading.client import TradingClient
 
-# -----------------------------
-# Logging setup
-# -----------------------------
 
 logger = logging.getLogger(__name__)
 
 
+# -----------------------------
+# Logging
+# -----------------------------
 def configure_logging():
-    """
-    Configure logging (stdout) for Railway.
-    Controlled by LOG_LEVEL env var: DEBUG, INFO, WARNING, ERROR, CRITICAL.
-    Default is INFO.
-    """
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+    logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(message)s")
     logger.setLevel(level)
     logger.info("Logging initialized at level %s", logging.getLevelName(level))
 
 
 # -----------------------------
-# Helpers / config
+# Helpers
 # -----------------------------
-
 def get_env(name: str, default=None, required: bool = False):
     value = os.getenv(name, default)
     if required and (value is None or str(value).strip() == ""):
@@ -53,39 +44,7 @@ def get_env(name: str, default=None, required: bool = False):
 
 def parse_symbol_list(env_var: str):
     raw = os.getenv(env_var, "")
-    symbols = [s.strip() for s in raw.split(",") if s.strip()]
-    logger.debug("Parsed %d symbols from %s: %s", len(symbols), env_var, symbols)
-    return symbols
-
-
-def get_google_client():
-    """Authorize gspread using a service account JSON from env."""
-    json_str = get_env("GOOGLE_SERVICE_ACCOUNT_JSON", required=True)
-    info = json.loads(json_str)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    logger.info("Initialized Google client for Sheets/Drive")
-    return gspread.authorize(creds)
-
-
-def open_target_worksheet(gc):
-    sheet_name = get_env("GOOGLE_SHEETS_SPREADSHEET_NAME", "Active-Investing")
-    tab_name = get_env("GOOGLE_SHEETS_WORKSHEET_NAME", "Automation-Screener")
-
-    logger.info("Opening spreadsheet '%s', worksheet '%s'", sheet_name, tab_name)
-    sh = gc.open(sheet_name)
-
-    try:
-        ws = sh.worksheet(tab_name)
-        logger.info("Found existing worksheet '%s'", tab_name)
-    except gspread.exceptions.WorksheetNotFound:
-        logger.warning("Worksheet '%s' not found; creating it", tab_name)
-        ws = sh.add_worksheet(title=tab_name, rows=1000, cols=30)
-
-    return ws
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
 
 
 def safe_float(x):
@@ -95,583 +54,423 @@ def safe_float(x):
         return None
 
 
-# -----------------------------
-# Indicator logic (Pine-style)
-# -----------------------------
-
-def compute_atr_rma(highs, lows, closes, length=10):
-    """
-    Pine's ta.atr = RMA(TrueRange, length).
-    Returns list of ATR values aligned with input (None where not yet defined).
-    """
-    n = len(closes)
-    if n == 0:
-        return []
-
-    tr = [0.0] * n
-    tr[0] = highs[0] - lows[0]
-
-    for i in range(1, n):
-        tr_hl = highs[i] - lows[i]
-        tr_hc = abs(highs[i] - closes[i - 1])
-        tr_lc = abs(lows[i] - closes[i - 1])
-        tr[i] = max(tr_hl, tr_hc, tr_lc)
-
-    atr = [None] * n
-    if n < length:
-        return atr
-
-    # seed RMA with SMA of first `length` TR values
-    seed = sum(tr[0:length]) / length
-    atr[length - 1] = seed
-
-    for i in range(length, n):
-        atr[i] = (atr[i - 1] * (length - 1) + tr[i]) / length
-
-    return atr
+def is_bad_num(x):
+    return x is None or (isinstance(x, float) and math.isnan(x))
 
 
-def compute_supertrend_like_trailing_stop(closes, atr, atr_mult=1.2):
-    """
-    SuperTrend-style trailing stop:
+def sheet_val(x):
+    if x is None:
+        return ""
+    if isinstance(x, float) and math.isnan(x):
+        return ""
+    return x
 
-    entryLoss = atr * atr_mult
-    if price > prevStop and pricePrev > prevStop:  # long regime
-        stop = max(prevStop, price - entryLoss)
-    elif price < prevStop and pricePrev < prevStop:  # short regime
-        stop = min(prevStop, price + entryLoss)
-    elif price > prevStop:  # flip to long
-        stop = price - entryLoss
-    else:                   # flip to short
-        stop = price + entryLoss
-    """
-    n = len(closes)
-    stop = [None] * n
-    if n == 0:
-        return stop
 
-    entry_loss = [a * atr_mult if a is not None else None for a in atr]
+def col_letter(n: int) -> str:
+    """1 -> A, 26 -> Z, 27 -> AA"""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
-    # find first index where ATR is defined
-    first_idx = None
-    for i, el in enumerate(entry_loss):
-        if el is not None and not math.isnan(el):
-            first_idx = i
-            break
 
-    if first_idx is None:
-        return stop
-
-    stop[first_idx] = closes[first_idx] - entry_loss[first_idx]
-
-    for i in range(first_idx + 1, n):
-        if entry_loss[i] is None:
+def drop_bad_rows(times, o, h, l, c, v, vwap, tc):
+    nt, no, nh, nl, nc, nv, nvw, ntc = [], [], [], [], [], [], [], []
+    for t, oo, hh, ll, cc, vv, vw, tcc in zip(times, o, h, l, c, v, vwap, tc):
+        if any(is_bad_num(x) for x in (oo, hh, ll, cc)):
             continue
-        prev_stop = stop[i - 1]
-        price = closes[i]
-        price_prev = closes[i - 1]
-
-        if prev_stop is None:
-            stop[i] = price - entry_loss[i]
-        else:
-            if price > prev_stop and price_prev > prev_stop:
-                # Long regime: trail up
-                stop[i] = max(prev_stop, price - entry_loss[i])
-            elif price < prev_stop and price_prev < prev_stop:
-                # Short regime: trail down
-                stop[i] = min(prev_stop, price + entry_loss[i])
-            elif price > prev_stop:
-                # Flip to long
-                stop[i] = price - entry_loss[i]
-            else:
-                # Flip to short
-                stop[i] = price + entry_loss[i]
-
-    return stop
-
-
-def compute_sma(values, length):
-    """
-    Pine ta.sma equivalent for a fixed window.
-    Returns list with None until enough data is present.
-    (Kept for possible future use; MA for latest bar is
-     now computed directly in build_metrics_from_ohlcv.)
-    """
-    n = len(values)
-    sma = [None] * n
-    if n < length:
-        return sma
-
-    window_sum = sum(values[0:length])
-    sma[length - 1] = window_sum / length
-
-    for i in range(length, n):
-        window_sum += values[i] - values[i - length]
-        sma[i] = window_sum / length
-
-    return sma
-
-
-def compute_buy_signals(closes, trailing_stop):
-    """
-    UT-style long buy:
-
-    crossover = close crosses above trailing stop
-    buy = (close > stop) and crossover
-    """
-    n = len(closes)
-    buys = [False] * n
-    for i in range(1, n):
-        s = trailing_stop[i]
-        s_prev = trailing_stop[i - 1]
-        if s is None or s_prev is None:
-            continue
-        crossover = (closes[i - 1] <= s_prev) and (closes[i] > s)
-        buys[i] = (closes[i] > s) and crossover
-    return buys
-
-
-def build_metrics_from_ohlcv(times, opens, highs, lows, closes, volumes, is_crypto: bool):
-    """
-    Given full OHLCV arrays, compute all metrics needed for your strategy on the latest bar.
-    For MA:
-      - Crypto: target length = 240
-      - Stocks: target length = 825
-      - Younger assets: use effective_len = min(target_len, num_bars)
-    """
-    n = len(closes)
-    if n == 0:
-        logger.warning("build_metrics_from_ohlcv called with no data (n=0)")
-        return {"status": "NO_DATA"}
-
-    # 1) ATR(10) and trailing stop
-    atr = compute_atr_rma(highs, lows, closes, length=10)
-    trailing = compute_supertrend_like_trailing_stop(closes, atr, atr_mult=1.2)
-    buys = compute_buy_signals(closes, trailing)
-
-    idx = n - 1
-    last_time = times[idx]
-    last_open = opens[idx]
-    last_high = highs[idx]
-    last_low = lows[idx]
-    last_close = closes[idx]
-    last_volume = volumes[idx]
-
-    atr_last = atr[idx]
-    trailing_last = trailing[idx]
-    buy_last = buys[idx]
-
-    # 2) Long MA: 240 (crypto) vs 825 (stocks), but allow shorter for young assets
-    target_ma_len = 240 if is_crypto else 825
-    effective_ma_len = min(target_ma_len, n)
-
-    # Always compute an MA on the latest bar using as many bars as we have (up to target_ma_len)
-    window_closes = closes[n - effective_ma_len: n]
-    sma_last = sum(window_closes) / effective_ma_len if effective_ma_len > 0 else None
-
-    price_minus_ma = None
-    pct_diff = None
-    above_zone = None
-
-    if sma_last is not None and sma_last != 0:
-        price_minus_ma = last_close - sma_last
-        pct_diff = (price_minus_ma / sma_last) * 100.0
-        above_zone = price_minus_ma >= 0
-
-    long_regime = None
-    if trailing_last is not None:
-        long_regime = last_close > trailing_last
-
-    # "Enough history" for status = OK is driven by ATR (10 bars),
-    # but MA-related columns are always filled as long as n >= 1.
-    had_enough_history = atr_last is not None
-    status = "OK" if had_enough_history else "INSUFFICIENT_HISTORY"
-
-    logger.debug(
-        "Metrics (%s, bars=%d): status=%s last_close=%s atr_10=%s trailing=%s "
-        "long_regime=%s buy_signal=%s ma_len=%s pct_diff=%s",
-        "crypto" if is_crypto else "stock",
-        n,
-        status,
-        last_close,
-        atr_last,
-        trailing_last,
-        long_regime,
-        buy_last,
-        effective_ma_len,
-        pct_diff,
-    )
-
-    return {
-        "status": status,
-        "last_time": last_time,
-        "last_open": last_open,
-        "last_high": last_high,
-        "last_low": last_low,
-        "last_close": last_close,
-        "last_volume": last_volume,
-        "atr_10": atr_last,
-        "atr_entry_loss": atr_last * 1.2 if atr_last is not None else None,
-        "trailing_stop": trailing_last,
-        "long_regime": long_regime,
-        "buy_signal": buy_last,
-        # actual number of bars used in the MA
-        "ma_length": effective_ma_len,
-        "long_sma": sma_last,
-        "price_minus_ma": price_minus_ma,
-        "pct_diff": pct_diff,
-        "above_buy_zone": above_zone,
-        "num_bars": n,
-        "had_enough_history": had_enough_history,
-    }
+        nt.append(t)
+        no.append(oo)
+        nh.append(hh)
+        nl.append(ll)
+        nc.append(cc)
+        nv.append(0.0 if is_bad_num(vv) else vv)
+        nvw.append(None if is_bad_num(vw) else vw)
+        ntc.append(None if is_bad_num(tcc) else tcc)
+    return nt, no, nh, nl, nc, nv, nvw, ntc
 
 
 # -----------------------------
-# Alpaca data
+# Google Sheets
 # -----------------------------
-
-def get_alpaca_clients():
-    api_key = get_env("ALPACA_API_KEY", required=True)
-    api_secret = get_env("ALPACA_API_SECRET", required=True)
-
-    logger.info("Creating Alpaca stock & crypto clients")
-    stock_client = StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)
-    # crypto data does not need keys, but we can still pass them
-    crypto_client = CryptoHistoricalDataClient()
-
-    return stock_client, crypto_client
+def get_google_client():
+    json_str = get_env("GOOGLE_SERVICE_ACCOUNT_JSON", required=True)
+    info = json.loads(json_str)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
 
 
-def fetch_alpaca_bars(symbol: str, is_crypto: bool, stock_client, crypto_client, max_days: int):
-    """
-    Fetch daily bars from Alpaca (stocks vs crypto).
-    Returns aligned lists: times, opens, highs, lows, closes, volumes
-    """
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(days=max_days)
+def open_target_worksheet(gc):
+    sheet_name = get_env("GOOGLE_SHEETS_SPREADSHEET_NAME", "Active-Investing")
+    tab_name = get_env("GOOGLE_SHEETS_WORKSHEET_NAME", "Alpaca-Stocks")
 
-    logger.info(
-        "Fetching Alpaca bars for %s (crypto=%s, start=%s, end=%s, max_days=%d)",
-        symbol,
-        is_crypto,
-        start.isoformat(),
-        now.isoformat(),
-        max_days,
-    )
-
-    if is_crypto:
-        req = CryptoBarsRequest(
-            symbol_or_symbols=[symbol],
-            timeframe=TimeFrame.Day,
-            start=start,
-            end=now,
-            limit=max_days,
-        )
-        bars = crypto_client.get_crypto_bars(req)
-        # alpaca-py: bars.data[symbol] is list[Bar]
-        series = bars.data[symbol] if hasattr(bars, "data") else bars[symbol]
-    else:
-        # For stocks, use split-adjusted data so long MAs & indicators
-        # match charting platforms like TradingView.
-        req = StockBarsRequest(
-            symbol_or_symbols=[symbol],
-            timeframe=TimeFrame.Day,
-            start=start,
-            end=now,
-            limit=max_days,
-            feed=DataFeed.IEX,          # force IEX, avoid SIP error
-            adjustment=Adjustment.SPLIT # <-- key change: use split-adjusted prices
-        )
-        bars = stock_client.get_stock_bars(req)
-        series = bars.data[symbol] if hasattr(bars, "data") else bars[symbol]
-
-    num_bars = len(series)
-    logger.info("Alpaca returned %d bars for %s", num_bars, symbol)
-
-    if num_bars == 0:
-        logger.warning("No Alpaca data returned for %s", symbol)
-    elif num_bars < max_days:
-        logger.info(
-            "%s returned fewer bars (%d) than max_days (%d) – likely limited by asset history or API.",
-            symbol, num_bars, max_days
-        )
-
-    times = []
-    opens = []
-    highs = []
-    lows = []
-    closes = []
-    volumes = []
-
-    for bar in series:
-        # Bar objects have attributes, not dict keys
-        t = getattr(bar, "timestamp", None)
-        o = safe_float(getattr(bar, "open", None))
-        h = safe_float(getattr(bar, "high", None))
-        l = safe_float(getattr(bar, "low", None))
-        c = safe_float(getattr(bar, "close", None))
-        v = safe_float(getattr(bar, "volume", 0.0))
-
-        times.append(str(t))
-        opens.append(o)
-        highs.append(h)
-        lows.append(l)
-        closes.append(c)
-        volumes.append(v)
-
-    return times, opens, highs, lows, closes, volumes
-
-
-# -----------------------------
-# Kraken data
-# -----------------------------
-
-def fetch_kraken_ohlc(pair: str, max_days: int):
-    """
-    Fetch daily OHLC from Kraken REST API.
-    Kraken's OHLC interval 1440 = 1 day.
-    The endpoint returns up to 720 entries; we just slice the last `max_days`.
-    """
-    url = "https://api.kraken.com/0/public/OHLC"
-    params = {
-        "pair": pair,
-        "interval": 1440,
-    }
-
-    logger.info("Fetching Kraken OHLC for %s (max_days=%d)", pair, max_days)
-
-    resp = requests.get(url, params=params, timeout=15)
+    sh = gc.open(sheet_name)
     try:
-        resp.raise_for_status()
-    except Exception:
-        logger.exception("HTTP error from Kraken for %s. Body (truncated): %s", pair, resp.text[:500])
-        raise
-
-    data = resp.json()
-
-    if data.get("error"):
-        logger.error("Kraken error for %s: %s", pair, data["error"])
-        raise RuntimeError(f"Kraken error for {pair}: {data['error']}")
-
-    result = data["result"]
-    # result keys: e.g. "XXBTZUSD" and "last"
-    series_key = None
-    for k in result.keys():
-        if k != "last":
-            series_key = k
-            break
-
-    if series_key is None:
-        logger.error("No OHLC series in Kraken result for %s", pair)
-        raise RuntimeError(f"No OHLC series in Kraken result for {pair}")
-
-    raw_series = result[series_key]
-    raw_len = len(raw_series)
-    logger.info("Kraken returned %d raw OHLC rows for %s", raw_len, pair)
-
-    if raw_len > max_days:
-        logger.info(
-            "Slicing Kraken data for %s from %d to last %d entries",
-            pair, raw_len, max_days
-        )
-        raw_series = raw_series[-max_days:]
-
-    times = []
-    opens = []
-    highs = []
-    lows = []
-    closes = []
-    volumes = []
-
-    # each entry: [time, open, high, low, close, vwap, volume, count]
-    for row in raw_series:
-        ts = datetime.fromtimestamp(row[0], tz=timezone.utc)
-        o = safe_float(row[1])
-        h = safe_float(row[2])
-        l = safe_float(row[3])
-        c = safe_float(row[4])
-        v = safe_float(row[6])
-
-        times.append(ts.isoformat())
-        opens.append(o)
-        highs.append(h)
-        lows.append(l)
-        closes.append(c)
-        volumes.append(v)
-
-    return times, opens, highs, lows, closes, volumes
+        return sh.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        logger.warning("Worksheet '%s' not found; creating it", tab_name)
+        return sh.add_worksheet(title=tab_name, rows=1000, cols=60)
 
 
-# -----------------------------
-# Google Sheets writing
-# -----------------------------
-
-def metrics_to_row(broker: str, symbol: str, is_crypto: bool, metrics: dict):
-    """
-    Flatten metrics dict into a single row for Google Sheets.
-    """
-    return [
-        metrics.get("status", ""),
-        broker,
-        symbol,
-        "TRUE" if is_crypto else "FALSE",
-        metrics.get("last_time", ""),
-        metrics.get("last_open", ""),
-        metrics.get("last_high", ""),
-        metrics.get("last_low", ""),
-        metrics.get("last_close", ""),
-        metrics.get("last_volume", ""),
-        metrics.get("atr_10", ""),
-        metrics.get("atr_entry_loss", ""),
-        metrics.get("trailing_stop", ""),
-        "TRUE" if metrics.get("long_regime") else "FALSE" if metrics.get("long_regime") is not None else "",
-        "TRUE" if metrics.get("buy_signal") else "FALSE" if metrics.get("buy_signal") is not None else "",
-        metrics.get("ma_length", ""),   # effective MA window size actually used
-        metrics.get("long_sma", ""),
-        metrics.get("price_minus_ma", ""),
-        metrics.get("pct_diff", ""),
-        "TRUE" if metrics.get("above_buy_zone") else "FALSE" if metrics.get("above_buy_zone") is not None else "",
-        metrics.get("num_bars", ""),
-        "TRUE" if metrics.get("had_enough_history") else "FALSE" if metrics.get("had_enough_history") is not None else "",
-    ]
-
-
-def write_rows_to_sheet(ws, rows):
-    header = [
-        "status",
-        "broker",
-        "symbol",
-        "is_crypto",
-        "last_bar_time",
-        "last_open",
-        "last_high",
-        "last_low",
-        "last_close",
-        "last_volume",
-        "atr_10",
-        "atr_entry_loss",
-        "atr_trailing_stop",
-        "long_regime",
-        "buy_signal",
-        "ma_length",
-        "long_sma",
-        "price_minus_ma",
-        "pct_diff",
-        "above_buy_zone",
-        "num_bars",
-        "had_enough_history",
-    ]
-
+def write_rows_to_sheet(ws, header, rows):
     data = [header] + rows
+    last_col = col_letter(len(header))
+    clear_range = f"A:{last_col}"
+    logger.info("Clearing only %s then writing %d rows into %s", clear_range, len(rows), ws.title)
 
-    logger.info(
-        "Writing %d data rows (%d including header) to sheet '%s' (A:V)",
-        len(rows),
-        len(data),
-        ws.title,
-    )
-    if rows:
-        logger.debug("First data row: %s", rows[0])
-
-    # 🔧 IMPORTANT:
-    # Clear ONLY columns A:V so that W onward (external functions / formulas)
-    # remain untouched.
-    ws.batch_clear(['A:V'])
-
-    # Now write our data starting at A1; this only fills columns A–V.
+    ws.batch_clear([clear_range])
     ws.update("A1", data, value_input_option="RAW")
     logger.info("Sheet update complete.")
 
 
 # -----------------------------
-# Main orchestration
+# Alpaca fetch
 # -----------------------------
+def get_alpaca_clients():
+    api_key = get_env("ALPACA_API_KEY", required=True)
+    api_secret = get_env("ALPACA_API_SECRET", required=True)
 
-def main():
-    configure_logging()
-    logger.info("=== Screener run started ===")
+    stock_data = StockHistoricalDataClient(api_key=api_key, secret_key=api_secret)
+    trading = TradingClient(api_key=api_key, secret_key=api_secret, paper=True)  # paper flag is fine for metadata
+    return stock_data, trading
 
-    alpaca_symbols = parse_symbol_list("ALPACA_WHITELIST")
-    kraken_symbols = parse_symbol_list("KRAKEN_WHITELIST")
 
-    if not alpaca_symbols and not kraken_symbols:
-        logger.error("No symbols configured. Set ALPACA_WHITELIST and/or KRAKEN_WHITELIST.")
-        print("No symbols configured. Set ALPACA_WHITELIST and/or KRAKEN_WHITELIST.", file=sys.stderr)
-        sys.exit(1)
+def fetch_stock_bars(stock_client, symbol: str, calendar_days: int):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=calendar_days)
 
-    alpaca_crypto_symbols = set(parse_symbol_list("ALPACA_CRYPTO_SYMBOLS"))
-
-    logger.info(
-        "Configured symbols – Alpaca: %d (%s), Kraken: %d (%s), Alpaca-crypto: %d (%s)",
-        len(alpaca_symbols),
-        alpaca_symbols,
-        len(kraken_symbols),
-        kraken_symbols,
-        len(alpaca_crypto_symbols),
-        list(alpaca_crypto_symbols),
+    req = StockBarsRequest(
+        symbol_or_symbols=[symbol],
+        timeframe=TimeFrame.Day,
+        start=start,
+        end=now,
+        limit=calendar_days,          # limit is count, not days; this is fine
+        feed=DataFeed.IEX,
+        adjustment=Adjustment.SPLIT,
     )
 
-    # Clients
+    bars = stock_client.get_stock_bars(req)
+    series = bars.data.get(symbol, []) if hasattr(bars, "data") else bars.get(symbol, [])
+
+    times, o, h, l, c, v, vwap, tc = [], [], [], [], [], [], [], []
+    for bar in series:
+        t = getattr(bar, "timestamp", None)
+        times.append(t.isoformat() if hasattr(t, "isoformat") else str(t))
+        o.append(safe_float(getattr(bar, "open", None)))
+        h.append(safe_float(getattr(bar, "high", None)))
+        l.append(safe_float(getattr(bar, "low", None)))
+        c.append(safe_float(getattr(bar, "close", None)))
+        v.append(safe_float(getattr(bar, "volume", None)))
+        vwap.append(safe_float(getattr(bar, "vwap", None)))
+        tc.append(safe_float(getattr(bar, "trade_count", None)))
+
+    times, o, h, l, c, v, vwap, tc = drop_bad_rows(times, o, h, l, c, v, vwap, tc)
+    return times, o, h, l, c, v, vwap, tc
+
+
+def fetch_latest_trade_and_quote(stock_client, symbol: str):
+    """
+    Optional: latest trade & quote. If your alpaca-py version lacks these request classes
+    or you don't have access, we just return {}.
+    """
+    out = {}
+    try:
+        from alpaca.data.requests import StockLatestTradeRequest, StockLatestQuoteRequest
+    except Exception:
+        return out
+
+    try:
+        tr_req = StockLatestTradeRequest(symbol_or_symbols=[symbol], feed=DataFeed.IEX)
+        tr = stock_client.get_stock_latest_trade(tr_req)
+        trade = tr.data.get(symbol) if hasattr(tr, "data") else tr.get(symbol)
+        if trade:
+            out["last_trade_price"] = safe_float(getattr(trade, "price", None))
+            tt = getattr(trade, "timestamp", None)
+            out["last_trade_time"] = tt.isoformat() if hasattr(tt, "isoformat") else str(tt)
+    except Exception:
+        logger.debug("Latest trade unavailable for %s", symbol, exc_info=True)
+
+    try:
+        q_req = StockLatestQuoteRequest(symbol_or_symbols=[symbol], feed=DataFeed.IEX)
+        q = stock_client.get_stock_latest_quote(q_req)
+        quote = q.data.get(symbol) if hasattr(q, "data") else q.get(symbol)
+        if quote:
+            out["bid"] = safe_float(getattr(quote, "bid_price", None))
+            out["ask"] = safe_float(getattr(quote, "ask_price", None))
+    except Exception:
+        logger.debug("Latest quote unavailable for %s", symbol, exc_info=True)
+
+    return out
+
+
+def fetch_asset_meta(trading_client, symbol: str):
+    out = {}
+    try:
+        a = trading_client.get_asset(symbol)
+        out["asset_name"] = getattr(a, "name", "")
+        out["exchange"] = getattr(a, "exchange", "")
+        out["tradable"] = getattr(a, "tradable", None)
+        out["marginable"] = getattr(a, "marginable", None)
+        out["shortable"] = getattr(a, "shortable", None)
+        out["fractionable"] = getattr(a, "fractionable", None)
+        out["easy_to_borrow"] = getattr(a, "easy_to_borrow", None)
+    except Exception as e:
+        logger.debug("Asset meta unavailable for %s (%s)", symbol, e, exc_info=True)
+    return out
+
+
+# -----------------------------
+# Metrics
+# -----------------------------
+def sma_last(values, length: int):
+    n = len(values)
+    if n == 0:
+        return None
+    use = min(length, n)
+    window = values[-use:]
+    return sum(window) / use if use > 0 else None
+
+
+def atr_wilder_last(highs, lows, closes, length: int = 14):
+    n = len(closes)
+    if n < 2:
+        return None
+
+    # True Range
+    tr = []
+    for i in range(n):
+        if i == 0:
+            tr.append(highs[i] - lows[i])
+        else:
+            tr_hl = highs[i] - lows[i]
+            tr_hc = abs(highs[i] - closes[i - 1])
+            tr_lc = abs(lows[i] - closes[i - 1])
+            tr.append(max(tr_hl, tr_hc, tr_lc))
+
+    if n < length:
+        return None
+
+    # Seed with SMA
+    atr = sum(tr[:length]) / length
+    for i in range(length, n):
+        atr = (atr * (length - 1) + tr[i]) / length
+    return atr
+
+
+def volatility_annualized_pct(closes, length: int = 20):
+    n = len(closes)
+    if n < 2:
+        return None
+    use = min(length, n - 1)
+    # simple returns over last `use` days
+    rets = []
+    for i in range(n - use, n):
+        prev = closes[i - 1]
+        cur = closes[i]
+        if prev == 0:
+            continue
+        rets.append((cur / prev) - 1.0)
+    if len(rets) < 2:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    daily_sd = math.sqrt(var)
+    ann = daily_sd * math.sqrt(252.0)
+    return ann * 100.0
+
+
+def build_metrics(times, opens, highs, lows, closes, volumes, vwaps, trade_counts):
+    n = len(closes)
+    if n == 0:
+        return {"status": "NO_DATA"}
+
+    last_close = closes[-1]
+    prev_close = closes[-2] if n >= 2 else None
+    chg_1d_pct = None
+    if prev_close not in (None, 0):
+        chg_1d_pct = ((last_close / prev_close) - 1.0) * 100.0
+
+    sma50 = sma_last(closes, 50)
+    sma200 = sma_last(closes, 200)
+
+    pct_from_sma50 = None if (sma50 in (None, 0)) else ((last_close / sma50) - 1.0) * 100.0
+    pct_from_sma200 = None if (sma200 in (None, 0)) else ((last_close / sma200) - 1.0) * 100.0
+
+    atr14 = atr_wilder_last(highs, lows, closes, 14)
+
+    # 52-week high/low ~ 252 trading days (use what we have)
+    use_252 = min(252, n)
+    window = closes[-use_252:]
+    high_52w = max(window) if window else None
+    low_52w = min(window) if window else None
+
+    pct_off_52w_high = None if (high_52w in (None, 0)) else ((last_close / high_52w) - 1.0) * 100.0
+    pct_above_52w_low = None if (low_52w in (None, 0)) else ((last_close / low_52w) - 1.0) * 100.0
+
+    # avg vol / avg dollar vol (20d)
+    use_20 = min(20, n)
+    vol20 = volumes[-use_20:] if use_20 > 0 else []
+    close20 = closes[-use_20:] if use_20 > 0 else []
+    avg_vol_20d = (sum(vol20) / use_20) if use_20 > 0 else None
+    avg_close_20d = (sum(close20) / use_20) if use_20 > 0 else None
+    avg_dollar_vol_20d = None
+    if avg_vol_20d is not None and avg_close_20d is not None:
+        avg_dollar_vol_20d = avg_vol_20d * avg_close_20d
+
+    vol_20d_ann = volatility_annualized_pct(closes, 20)
+
+    return {
+        "status": "OK",
+        "last_bar_time": times[-1],
+        "close": last_close,
+        "prev_close": prev_close,
+        "change_1d_pct": chg_1d_pct,
+        "volume": volumes[-1],
+        "vwap": vwaps[-1],
+        "trade_count": trade_counts[-1],
+        "sma_50": sma50,
+        "sma_200": sma200,
+        "pct_from_sma_50": pct_from_sma50,
+        "pct_from_sma_200": pct_from_sma200,
+        "atr_14": atr14,
+        "high_52w": high_52w,
+        "low_52w": low_52w,
+        "pct_off_52w_high": pct_off_52w_high,
+        "pct_above_52w_low": pct_above_52w_low,
+        "avg_volume_20d": avg_vol_20d,
+        "avg_dollar_volume_20d": avg_dollar_vol_20d,
+        "volatility_20d_ann_pct": vol_20d_ann,
+        "num_bars": n,
+    }
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    configure_logging()
+    logger.info("=== Alpaca Stocks Screener run started ===")
+
+    symbols = parse_symbol_list("ALPACA_WHITELIST")
+    if not symbols:
+        logger.error("No symbols configured. Set ALPACA_WHITELIST.")
+        sys.exit(1)
+
+    # Pull enough calendar days to reliably cover 252 trading bars + SMAs
+    calendar_days = int(get_env("ALPACA_STOCK_CALENDAR_DAYS", 2200))
+
     gc = get_google_client()
     ws = open_target_worksheet(gc)
 
-    stock_client, crypto_client = get_alpaca_clients()
+    stock_client, trading_client = get_alpaca_clients()
+
+    header = [
+        "status",
+        "symbol",
+        "last_bar_time",
+        "close",
+        "prev_close",
+        "change_1d_pct",
+        "volume",
+        "vwap",
+        "trade_count",
+        "sma_50",
+        "sma_200",
+        "pct_from_sma_50",
+        "pct_from_sma_200",
+        "atr_14",
+        "high_52w",
+        "low_52w",
+        "pct_off_52w_high",
+        "pct_above_52w_low",
+        "avg_volume_20d",
+        "avg_dollar_volume_20d",
+        "volatility_20d_ann_pct",
+        "last_trade_price",
+        "last_trade_time",
+        "bid",
+        "ask",
+        "spread_pct",
+        "asset_name",
+        "exchange",
+        "tradable",
+        "marginable",
+        "shortable",
+        "fractionable",
+        "easy_to_borrow",
+        "num_bars",
+    ]
 
     rows = []
-    error_count = 0
+    errors = 0
 
-    # Alpaca symbols
-    for sym in alpaca_symbols:
-        is_crypto = sym in alpaca_crypto_symbols
+    for sym in symbols:
         try:
-            max_days = 300 if is_crypto else 1200  # enough to warm ATR + up to 825 bars for stocks
-            logger.info("Processing ALPACA %s (crypto=%s, max_days=%d)", sym, is_crypto, max_days)
+            logger.info("Processing %s", sym)
+            times, o, h, l, c, v, vwap, tc = fetch_stock_bars(stock_client, sym, calendar_days)
+            metrics = build_metrics(times, o, h, l, c, v, vwap, tc)
 
-            times, o, h, l, c, v = fetch_alpaca_bars(
-                sym, is_crypto, stock_client, crypto_client, max_days=max_days
-            )
-            metrics = build_metrics_from_ohlcv(times, o, h, l, c, v, is_crypto=is_crypto)
-            logger.info(
-                "Finished ALPACA %s: status=%s, num_bars=%s",
+            live = fetch_latest_trade_and_quote(stock_client, sym)
+            meta = fetch_asset_meta(trading_client, sym)
+
+            bid = live.get("bid")
+            ask = live.get("ask")
+            spread_pct = None
+            if bid is not None and ask is not None and ask != 0:
+                spread_pct = ((ask - bid) / ask) * 100.0
+
+            row = [
+                metrics.get("status", ""),
                 sym,
-                metrics.get("status"),
+                metrics.get("last_bar_time", ""),
+                metrics.get("close"),
+                metrics.get("prev_close"),
+                metrics.get("change_1d_pct"),
+                metrics.get("volume"),
+                metrics.get("vwap"),
+                metrics.get("trade_count"),
+                metrics.get("sma_50"),
+                metrics.get("sma_200"),
+                metrics.get("pct_from_sma_50"),
+                metrics.get("pct_from_sma_200"),
+                metrics.get("atr_14"),
+                metrics.get("high_52w"),
+                metrics.get("low_52w"),
+                metrics.get("pct_off_52w_high"),
+                metrics.get("pct_above_52w_low"),
+                metrics.get("avg_volume_20d"),
+                metrics.get("avg_dollar_volume_20d"),
+                metrics.get("volatility_20d_ann_pct"),
+                live.get("last_trade_price"),
+                live.get("last_trade_time"),
+                bid,
+                ask,
+                spread_pct,
+                meta.get("asset_name", ""),
+                meta.get("exchange", ""),
+                meta.get("tradable"),
+                meta.get("marginable"),
+                meta.get("shortable"),
+                meta.get("fractionable"),
+                meta.get("easy_to_borrow"),
                 metrics.get("num_bars"),
-            )
+            ]
+
+            rows.append([sheet_val(x) for x in row])
+
         except Exception as e:
-            error_count += 1
-            logger.exception("Error processing ALPACA symbol %s", sym)
-            metrics = {"status": f"ERROR: {e}"}
+            errors += 1
+            logger.exception("Error processing %s", sym)
+            rows.append(["ERROR", sym] + [""] * (len(header) - 2))
 
-        row = metrics_to_row("ALPACA", sym, is_crypto, metrics)
-        rows.append(row)
-
-    # Kraken symbols (all crypto)
-    for pair in kraken_symbols:
-        try:
-            logger.info("Processing KRAKEN %s", pair)
-            times, o, h, l, c, v = fetch_kraken_ohlc(pair, max_days=300)
-            metrics = build_metrics_from_ohlcv(times, o, h, l, c, v, is_crypto=True)
-            logger.info(
-                "Finished KRAKEN %s: status=%s, num_bars=%s",
-                pair,
-                metrics.get("status"),
-                metrics.get("num_bars"),
-            )
-        except Exception as e:
-            error_count += 1
-            logger.exception("Error processing KRAKEN pair %s", pair)
-            metrics = {"status": f"ERROR: {e}"}
-
-        row = metrics_to_row("KRAKEN", pair, True, metrics)
-        rows.append(row)
-
-    write_rows_to_sheet(ws, rows)
-    logger.info(
-        "=== Screener run complete. Wrote %d rows (errors: %d) ===",
-        len(rows),
-        error_count,
-    )
-    print(f"Wrote {len(rows)} rows to sheet.")
+    write_rows_to_sheet(ws, header, rows)
+    logger.info("=== Complete. Wrote %d rows (errors: %d) ===", len(rows), errors)
+    print(f"Wrote {len(rows)} rows to sheet. Errors: {errors}")
 
 
 if __name__ == "__main__":
