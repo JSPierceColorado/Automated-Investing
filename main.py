@@ -33,7 +33,7 @@ def configure_logging():
 
 
 # -----------------------------
-# Helpers
+# Env / Helpers
 # -----------------------------
 def get_env(name: str, default=None, required: bool = False):
     value = os.getenv(name, default)
@@ -41,6 +41,27 @@ def get_env(name: str, default=None, required: bool = False):
         logger.error("Missing required environment variable: %s", name)
         sys.exit(1)
     return value
+
+
+def get_env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    raw = os.getenv(name, "")
+    raw = str(raw).strip()
+    if raw == "":
+        val = default
+    else:
+        try:
+            val = int(raw)
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+            val = default
+
+    if min_value is not None and val < min_value:
+        logger.warning("%s=%s < %s; clamping", name, val, min_value)
+        val = min_value
+    if max_value is not None and val > max_value:
+        logger.warning("%s=%s > %s; clamping", name, val, max_value)
+        val = max_value
+    return val
 
 
 def truthy(x) -> bool:
@@ -208,52 +229,39 @@ def market_is_open() -> bool:
 # -----------------------------
 # Batched Alpaca fetches (speed-up)
 # -----------------------------
-def fetch_stock_bars_batch(stock_client, symbols, calendar_days: int):
+def fetch_stock_bars_batch(stock_client, symbols, lookback_days: int, bars_limit: int):
     """
     Fetch daily bars for MANY symbols in one call.
-    Returns dict: {symbol: (times, o, h, l, c, v, vwap, tc)}
+
+    IMPORTANT:
+      The Alpaca `limit` is a TOTAL limit across all symbols in the request.
+      To avoid starving later symbols, keep batch_size small enough that:
+        batch_size * expected_bars_per_symbol <= bars_limit
     """
     now = datetime.now(timezone.utc)
-    start = now - timedelta(days=calendar_days)
+    start = now - timedelta(days=lookback_days)
 
     req = StockBarsRequest(
         symbol_or_symbols=symbols,
         timeframe=TimeFrame.Day,
         start=start,
         end=now,
-        limit=calendar_days,
+        limit=bars_limit,
         feed=DataFeed.IEX,
         adjustment=Adjustment.SPLIT,
     )
 
     bars = stock_client.get_stock_bars(req)
-    data = bars.data if hasattr(bars, "data") else bars  # dict-like
+    data = bars.data if hasattr(bars, "data") else bars  # dict-like: symbol -> list[Bar]
+    if not isinstance(data, dict):
+        return {sym: [] for sym in symbols}
 
-    out = {}
-    for sym in symbols:
-        series = data.get(sym, []) if isinstance(data, dict) else []
-        times, o, h, l, c, v, vwap, tc = [], [], [], [], [], [], [], []
-        for bar in series:
-            t = getattr(bar, "timestamp", None)
-            times.append(t.isoformat() if hasattr(t, "isoformat") else str(t))
-            o.append(safe_float(getattr(bar, "open", None)))
-            h.append(safe_float(getattr(bar, "high", None)))
-            l.append(safe_float(getattr(bar, "low", None)))
-            c.append(safe_float(getattr(bar, "close", None)))
-            v.append(safe_float(getattr(bar, "volume", None)))
-            vwap.append(safe_float(getattr(bar, "vwap", None)))
-            tc.append(safe_float(getattr(bar, "trade_count", None)))
-
-        times, o, h, l, c, v, vwap, tc = drop_bad_rows(times, o, h, l, c, v, vwap, tc)
-        out[sym] = (times, o, h, l, c, v, vwap, tc)
-
-    return out
+    return {sym: data.get(sym, []) for sym in symbols}
 
 
 def fetch_latest_trade_and_quote_batch(stock_client, symbols):
     """
     Fetch latest trade + quote for MANY symbols in one call each.
-    Returns dict: {symbol: {"last_trade_price":..., "bid":..., "ask":...}}
     Missing is fine (allowed missing/0).
     """
     out = {s: {} for s in symbols}
@@ -288,6 +296,27 @@ def fetch_latest_trade_and_quote_batch(stock_client, symbols):
         logger.debug("Latest quote batch unavailable", exc_info=True)
 
     return out
+
+
+def bars_to_arrays(series):
+    """
+    Convert a list[Bar] to arrays for metric building.
+    Drops rows where OHLC is missing.
+    """
+    times, o, h, l, c, v, vwap, tc = [], [], [], [], [], [], [], []
+    for bar in series:
+        t = getattr(bar, "timestamp", None)
+        times.append(t.isoformat() if hasattr(t, "isoformat") else str(t))
+        o.append(safe_float(getattr(bar, "open", None)))
+        h.append(safe_float(getattr(bar, "high", None)))
+        l.append(safe_float(getattr(bar, "low", None)))
+        c.append(safe_float(getattr(bar, "close", None)))
+        v.append(safe_float(getattr(bar, "volume", None)))
+        vwap.append(safe_float(getattr(bar, "vwap", None)))
+        tc.append(safe_float(getattr(bar, "trade_count", None)))
+
+    times, o, h, l, c, v, vwap, tc = drop_bad_rows(times, o, h, l, c, v, vwap, tc)
+    return o, h, l, c, v, vwap, tc
 
 
 # -----------------------------
@@ -399,7 +428,7 @@ def required_fields_for_drop(sym: str, metrics: dict):
 
 
 # -----------------------------
-# One full run (single pass over whitelist) - batched
+# One full run (single pass over whitelist) - batched safely
 # -----------------------------
 def run_once():
     symbols = parse_symbol_list("ALPACA_WHITELIST")
@@ -407,12 +436,44 @@ def run_once():
         logger.error("No symbols configured. Set ALPACA_WHITELIST.")
         return
 
-    calendar_days = int(get_env("ALPACA_STOCK_CALENDAR_DAYS", 2200))
-    batch_size = int(get_env("ALPACA_BATCH_SIZE", 200))
+    # Legacy setting (kept), but we *default* the actual bars lookback smaller
+    # because your metrics only require ~252 trading days + buffers.
+    calendar_days = get_env_int("ALPACA_STOCK_CALENDAR_DAYS", 2200, min_value=30, max_value=10000)
+
+    # Bars lookback used for the request.
+    # Default: min(calendar_days, 600) to preserve the option of larger lookbacks,
+    # while making the default fast and still sufficient for SMA200 + 52w + ATR14 + 20d.
+    lookback_days = get_env_int("ALPACA_BARS_LOOKBACK_DAYS", min(calendar_days, 600), min_value=30, max_value=10000)
+
+    # Total limit across all symbols in a single bars request.
+    bars_limit = get_env_int("ALPACA_BARS_LIMIT", 10000, min_value=500, max_value=10000)
+
+    # Desired batch size; we'll clamp it down to a safe value automatically.
+    desired_batch_size = get_env_int("ALPACA_BATCH_SIZE", 25, min_value=1, max_value=500)
+
+    # Optional: sleep briefly between batches to be nice to APIs.
+    batch_sleep = float(str(get_env("ALPACA_BATCH_SLEEP_SECONDS", "0")).strip() or "0")
+
+    # Compute a "safe" batch size so we don't starve symbols due to the shared limit.
+    # Daily bars: trading days are ~70-75% of calendar days. Use 0.80 as conservative.
+    est_bars_per_symbol = max(1, int(math.ceil(lookback_days * 0.80)))
+    safe_batch_size = max(1, bars_limit // est_bars_per_symbol)
+    batch_size = min(desired_batch_size, safe_batch_size)
+
+    if batch_size != desired_batch_size:
+        logger.warning(
+            "Reducing batch size from %d to %d to avoid limit starvation "
+            "(lookback_days=%d, bars_limit=%d, est_bars_per_symbol=%d).",
+            desired_batch_size, batch_size, lookback_days, bars_limit, est_bars_per_symbol
+        )
+
+    logger.info(
+        "Config: symbols=%d lookback_days=%d bars_limit=%d batch_size=%d (desired=%d) batch_sleep=%s",
+        len(symbols), lookback_days, bars_limit, batch_size, desired_batch_size, batch_sleep
+    )
 
     gc = get_google_client()
     ws = open_target_worksheet(gc)
-
     stock_client = get_alpaca_data_client()
 
     header = [
@@ -444,10 +505,12 @@ def run_once():
 
         # 1) Historical bars (ONE call per batch)
         try:
-            bars_map = fetch_stock_bars_batch(stock_client, batch, calendar_days)
+            bars_map = fetch_stock_bars_batch(stock_client, batch, lookback_days, bars_limit)
         except Exception:
             logger.exception("Bars batch failed; dropping these %d symbols", len(batch))
             dropped += len(batch)
+            if batch_sleep > 0:
+                time.sleep(batch_sleep)
             continue
 
         # 2) Latest trade/quote (TWO calls per batch). Optional fields only.
@@ -456,11 +519,17 @@ def run_once():
         # 3) Per-symbol metrics + drop logic (CPU-only)
         for sym in batch:
             try:
-                times, o, h, l, c, v, vwap, tc = bars_map.get(sym, ([], [], [], [], [], [], [], []))
+                series = bars_map.get(sym, []) or []
+                if not series:
+                    dropped += 1
+                    logger.warning("Dropping %s (no bars returned)", sym)
+                    continue
+
+                o, h, l, c, v, vwap, tc = bars_to_arrays(series)
                 metrics = build_metrics(o, h, l, c, v, vwap, tc)
                 if not metrics.get("ok"):
                     dropped += 1
-                    logger.warning("Dropping %s (no data)", sym)
+                    logger.warning("Dropping %s (no usable data after cleaning)", sym)
                     continue
 
                 live = live_map.get(sym, {}) or {}
@@ -504,6 +573,9 @@ def run_once():
                 logger.exception("Dropping %s due to exception", sym)
                 continue
 
+        if batch_sleep > 0:
+            time.sleep(batch_sleep)
+
     rows.sort(key=lambda r: str(r[0]))
     write_rows_to_sheet(ws, header, rows)
 
@@ -517,8 +589,8 @@ def main():
     configure_logging()
     logger.info("=== Alpaca Stocks Screener (perpetual) started ===")
 
-    poll_seconds = int(get_env("MARKET_POLL_SECONDS", 60))          # check once per minute
-    post_run_sleep = int(get_env("POST_RUN_SLEEP_SECONDS", 60))     # small pause after run
+    poll_seconds = get_env_int("MARKET_POLL_SECONDS", 60, min_value=5, max_value=3600)
+    post_run_sleep = get_env_int("POST_RUN_SLEEP_SECONDS", 60, min_value=0, max_value=3600)
 
     while True:
         try:
@@ -533,11 +605,9 @@ def main():
             dur = (ended - started).total_seconds()
             logger.info("run_once() finished at %s (duration %.1f sec)", ended.isoformat(), dur)
 
-            # After the long run, just pause briefly then loop back (will re-check open)
             time.sleep(post_run_sleep)
 
         except Exception:
-            # Don't die; log and keep looping
             logger.exception("Top-level loop exception; sleeping then continuing.")
             time.sleep(poll_seconds)
 
