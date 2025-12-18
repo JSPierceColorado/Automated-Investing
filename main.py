@@ -123,6 +123,11 @@ def is_blank_or_zero(v) -> bool:
     return False
 
 
+def chunked(lst, size: int):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+
 # -----------------------------
 # Google Sheets
 # -----------------------------
@@ -200,12 +205,19 @@ def market_is_open() -> bool:
         return False
 
 
-def fetch_stock_bars(stock_client, symbol: str, calendar_days: int):
+# -----------------------------
+# Batched Alpaca fetches (speed-up)
+# -----------------------------
+def fetch_stock_bars_batch(stock_client, symbols, calendar_days: int):
+    """
+    Fetch daily bars for MANY symbols in one call.
+    Returns dict: {symbol: (times, o, h, l, c, v, vwap, tc)}
+    """
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=calendar_days)
 
     req = StockBarsRequest(
-        symbol_or_symbols=[symbol],
+        symbol_or_symbols=symbols,
         timeframe=TimeFrame.Day,
         start=start,
         end=now,
@@ -215,53 +227,65 @@ def fetch_stock_bars(stock_client, symbol: str, calendar_days: int):
     )
 
     bars = stock_client.get_stock_bars(req)
-    series = bars.data.get(symbol, []) if hasattr(bars, "data") else bars.get(symbol, [])
+    data = bars.data if hasattr(bars, "data") else bars  # dict-like
 
-    times, o, h, l, c, v, vwap, tc = [], [], [], [], [], [], [], []
-    for bar in series:
-        t = getattr(bar, "timestamp", None)
-        times.append(t.isoformat() if hasattr(t, "isoformat") else str(t))
-        o.append(safe_float(getattr(bar, "open", None)))
-        h.append(safe_float(getattr(bar, "high", None)))
-        l.append(safe_float(getattr(bar, "low", None)))
-        c.append(safe_float(getattr(bar, "close", None)))
-        v.append(safe_float(getattr(bar, "volume", None)))
-        vwap.append(safe_float(getattr(bar, "vwap", None)))
-        tc.append(safe_float(getattr(bar, "trade_count", None)))
-
-    times, o, h, l, c, v, vwap, tc = drop_bad_rows(times, o, h, l, c, v, vwap, tc)
-    return times, o, h, l, c, v, vwap, tc
-
-
-def fetch_latest_trade_and_quote(stock_client, symbol: str):
-    """
-    Optional: latest trade & quote.
-    Allowed to be missing/0 (we do NOT drop based on these fields).
-    """
     out = {}
+    for sym in symbols:
+        series = data.get(sym, []) if isinstance(data, dict) else []
+        times, o, h, l, c, v, vwap, tc = [], [], [], [], [], [], [], []
+        for bar in series:
+            t = getattr(bar, "timestamp", None)
+            times.append(t.isoformat() if hasattr(t, "isoformat") else str(t))
+            o.append(safe_float(getattr(bar, "open", None)))
+            h.append(safe_float(getattr(bar, "high", None)))
+            l.append(safe_float(getattr(bar, "low", None)))
+            c.append(safe_float(getattr(bar, "close", None)))
+            v.append(safe_float(getattr(bar, "volume", None)))
+            vwap.append(safe_float(getattr(bar, "vwap", None)))
+            tc.append(safe_float(getattr(bar, "trade_count", None)))
+
+        times, o, h, l, c, v, vwap, tc = drop_bad_rows(times, o, h, l, c, v, vwap, tc)
+        out[sym] = (times, o, h, l, c, v, vwap, tc)
+
+    return out
+
+
+def fetch_latest_trade_and_quote_batch(stock_client, symbols):
+    """
+    Fetch latest trade + quote for MANY symbols in one call each.
+    Returns dict: {symbol: {"last_trade_price":..., "bid":..., "ask":...}}
+    Missing is fine (allowed missing/0).
+    """
+    out = {s: {} for s in symbols}
     try:
         from alpaca.data.requests import StockLatestTradeRequest, StockLatestQuoteRequest
     except Exception:
         return out
 
+    # Latest trades
     try:
-        tr_req = StockLatestTradeRequest(symbol_or_symbols=[symbol], feed=DataFeed.IEX)
+        tr_req = StockLatestTradeRequest(symbol_or_symbols=symbols, feed=DataFeed.IEX)
         tr = stock_client.get_stock_latest_trade(tr_req)
-        trade = tr.data.get(symbol) if hasattr(tr, "data") else tr.get(symbol)
-        if trade:
-            out["last_trade_price"] = safe_float(getattr(trade, "price", None))
+        tr_data = tr.data if hasattr(tr, "data") else tr
+        if isinstance(tr_data, dict):
+            for sym, trade in tr_data.items():
+                if trade:
+                    out.setdefault(sym, {})["last_trade_price"] = safe_float(getattr(trade, "price", None))
     except Exception:
-        logger.debug("Latest trade unavailable for %s", symbol, exc_info=True)
+        logger.debug("Latest trade batch unavailable", exc_info=True)
 
+    # Latest quotes
     try:
-        q_req = StockLatestQuoteRequest(symbol_or_symbols=[symbol], feed=DataFeed.IEX)
+        q_req = StockLatestQuoteRequest(symbol_or_symbols=symbols, feed=DataFeed.IEX)
         q = stock_client.get_stock_latest_quote(q_req)
-        quote = q.data.get(symbol) if hasattr(q, "data") else q.get(symbol)
-        if quote:
-            out["bid"] = safe_float(getattr(quote, "bid_price", None))
-            out["ask"] = safe_float(getattr(quote, "ask_price", None))
+        q_data = q.data if hasattr(q, "data") else q
+        if isinstance(q_data, dict):
+            for sym, quote in q_data.items():
+                if quote:
+                    out.setdefault(sym, {})["bid"] = safe_float(getattr(quote, "bid_price", None))
+                    out.setdefault(sym, {})["ask"] = safe_float(getattr(quote, "ask_price", None))
     except Exception:
-        logger.debug("Latest quote unavailable for %s", symbol, exc_info=True)
+        logger.debug("Latest quote batch unavailable", exc_info=True)
 
     return out
 
@@ -375,7 +399,7 @@ def required_fields_for_drop(sym: str, metrics: dict):
 
 
 # -----------------------------
-# One full run (single pass over whitelist)
+# One full run (single pass over whitelist) - batched
 # -----------------------------
 def run_once():
     symbols = parse_symbol_list("ALPACA_WHITELIST")
@@ -384,6 +408,7 @@ def run_once():
         return
 
     calendar_days = int(get_env("ALPACA_STOCK_CALENDAR_DAYS", 2200))
+    batch_size = int(get_env("ALPACA_BATCH_SIZE", 200))
 
     gc = get_google_client()
     ws = open_target_worksheet(gc)
@@ -414,57 +439,70 @@ def run_once():
     rows = []
     dropped = 0
 
-    for sym in symbols:
+    for batch in chunked(symbols, batch_size):
+        logger.info("Processing batch of %d symbols", len(batch))
+
+        # 1) Historical bars (ONE call per batch)
         try:
-            logger.info("Processing %s", sym)
-            times, o, h, l, c, v, vwap, tc = fetch_stock_bars(stock_client, sym, calendar_days)
-            metrics = build_metrics(o, h, l, c, v, vwap, tc)
-            if not metrics.get("ok"):
-                dropped += 1
-                logger.warning("Dropping %s (no data)", sym)
-                continue
-
-            # live fields allowed missing/0
-            live = fetch_latest_trade_and_quote(stock_client, sym)
-            bid = live.get("bid")
-            ask = live.get("ask")
-            spread_pct = None
-            if bid is not None and ask is not None and ask != 0:
-                spread_pct = ((ask - bid) / ask) * 100.0
-
-            req = required_fields_for_drop(sym, metrics)
-            missing = [k for k, v in req.items() if is_blank_or_zero(v)]
-            if missing:
-                dropped += 1
-                logger.warning("Dropping %s due to blank/0 in: %s", sym, ",".join(missing))
-                continue
-
-            row = [
-                sym,
-                metrics.get("close"),
-                metrics.get("prev_close"),
-                metrics.get("volume"),
-                metrics.get("vwap"),
-                metrics.get("trade_count"),
-                metrics.get("sma_50"),
-                metrics.get("sma_200"),
-                metrics.get("atr_14"),
-                metrics.get("high_52w"),
-                metrics.get("low_52w"),
-                metrics.get("avg_volume_20d"),
-                metrics.get("avg_dollar_volume_20d"),
-                live.get("last_trade_price"),
-                bid,
-                ask,
-                spread_pct,
-                metrics.get("num_bars"),
-            ]
-            rows.append([sheet_val(x) for x in row])
-
+            bars_map = fetch_stock_bars_batch(stock_client, batch, calendar_days)
         except Exception:
-            dropped += 1
-            logger.exception("Dropping %s due to exception", sym)
+            logger.exception("Bars batch failed; dropping these %d symbols", len(batch))
+            dropped += len(batch)
             continue
+
+        # 2) Latest trade/quote (TWO calls per batch). Optional fields only.
+        live_map = fetch_latest_trade_and_quote_batch(stock_client, batch)
+
+        # 3) Per-symbol metrics + drop logic (CPU-only)
+        for sym in batch:
+            try:
+                times, o, h, l, c, v, vwap, tc = bars_map.get(sym, ([], [], [], [], [], [], [], []))
+                metrics = build_metrics(o, h, l, c, v, vwap, tc)
+                if not metrics.get("ok"):
+                    dropped += 1
+                    logger.warning("Dropping %s (no data)", sym)
+                    continue
+
+                live = live_map.get(sym, {}) or {}
+                bid = live.get("bid")
+                ask = live.get("ask")
+                spread_pct = None
+                if bid is not None and ask is not None and ask != 0:
+                    spread_pct = ((ask - bid) / ask) * 100.0
+
+                req = required_fields_for_drop(sym, metrics)
+                missing = [k for k, vv in req.items() if is_blank_or_zero(vv)]
+                if missing:
+                    dropped += 1
+                    logger.warning("Dropping %s due to blank/0 in: %s", sym, ",".join(missing))
+                    continue
+
+                row = [
+                    sym,
+                    metrics.get("close"),
+                    metrics.get("prev_close"),
+                    metrics.get("volume"),
+                    metrics.get("vwap"),
+                    metrics.get("trade_count"),
+                    metrics.get("sma_50"),
+                    metrics.get("sma_200"),
+                    metrics.get("atr_14"),
+                    metrics.get("high_52w"),
+                    metrics.get("low_52w"),
+                    metrics.get("avg_volume_20d"),
+                    metrics.get("avg_dollar_volume_20d"),
+                    live.get("last_trade_price"),
+                    bid,
+                    ask,
+                    spread_pct,
+                    metrics.get("num_bars"),
+                ]
+                rows.append([sheet_val(x) for x in row])
+
+            except Exception:
+                dropped += 1
+                logger.exception("Dropping %s due to exception", sym)
+                continue
 
     rows.sort(key=lambda r: str(r[0]))
     write_rows_to_sheet(ws, header, rows)
